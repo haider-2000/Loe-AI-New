@@ -1,0 +1,48 @@
+# Render blueprint for the Leo educational Telegram bot.
+# Create it with: Render Dashboard -> New -> Blueprint -> point at this repo.
+#
+# Why this looks the way it does:
+#   * The bot talks to Telegram over long polling, so it never receives an
+#     inbound request on its own. Render therefore needs a web service with a
+#     bound port: bot.py answers GET /health and pings itself every few minutes,
+#     which is what stops a free instance from being treated as idle.
+#   * A free Render instance has no persistent disk, so the data cannot live in
+#     the container. DB_URL points at a free remote database instead, and the
+#     image bytes are stored there too. See README.md for how to create it.
+services:
+  - type: web
+    name: leo-edu-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    # Push to GitHub, then press Deploy manually in the dashboard.
+    autoDeploy: false
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.4"
+      # sync: false means Render asks for the value during blueprint creation and
+      # stores it as a secret. No value is ever written into this file.
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: ALLOWED_CHAT_ID
+        sync: false
+      # The free remote database that survives container restarts:
+      - key: DB_URL
+        sync: false
+      - key: DB_AUTH_TOKEN
+        sync: false
+      # How often to push an archive to the admin's private chat, in minutes.
+      # Set to 0 to turn the automatic backup off.
+      - key: AUTO_BACKUP_MINUTES
+        value: "15"
+      # These two have working defaults in config.py:
+      #   GEMINI_MODEL    -> gemini-3.7-flash
+      #   DATABASE_PATH   -> data/edu_bot.db
+      # PORT is supplied by Render and is read by bot.py.

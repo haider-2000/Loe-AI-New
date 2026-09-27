@@ -1,0 +1,9 @@
+.env
+*.db
+data/raw/
+data/exports/
+logs/
+__pycache__/
+*.py[cod]
+.venv/
+Leo AI/ 
