@@ -31,8 +31,6 @@ services:
         sync: false
       - key: ADMIN_ID
         sync: false
-      - key: ALLOWED_CHAT_ID
-        sync: false
       # The free remote database that survives container restarts:
       - key: DB_URL
         sync: false

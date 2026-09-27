@@ -57,11 +57,12 @@ def is_admin(update: Update) -> bool:
 
 
 def allowed_chat_only(handler):
-    """Allow the configured group, plus the admin's own private chat.
+    """Serve every group the bot is a member of.
 
-    The admin can drive the bot directly in private, which is how the bot gets
-    tested and how /backup is triggered from a laptop. No other private chat is
-    served, so students still cannot use the bot outside the group.
+    There is no group allowlist any more: any group or supergroup that adds the
+    bot gets an answer, so a new class does not need a deployment first. Private
+    chats stay reserved for the owner, which is where /backup lives and where
+    the bot gets driven by hand.
     """
     @wraps(handler)
     async def guarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -72,11 +73,9 @@ def allowed_chat_only(handler):
             logger.info("Ignoring private chat from non-admin %s",
                         update.effective_user.id if update.effective_user else None)
             return
-        if not chat or chat.id != settings.allowed_chat_id or chat.type not in {
-            ChatType.GROUP,
-            ChatType.SUPERGROUP,
-        }:
-            logger.info("Ignoring update from unauthorized chat %s", chat.id if chat else None)
+        if not chat or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            logger.info("Ignoring update from chat type %s",
+                        chat.type if chat else None)
             return
         return await handler(update, context)
 
@@ -87,15 +86,19 @@ def private_only(handler):
     """Allow this command only in the admin's own private chat.
 
     A backup archive holds the whole database, so it must never be posted into
-    the group where every student can see and download it. Outside private the
-    bot answers nothing at all, so the command is not even discoverable in the
-    group: a silent ignore, not a hint.
+    a group or handed to a stranger who opened a private chat. Both the chat
+    type and the sender are checked, because an open private chat would
+    otherwise be enough to pull the whole dataset.
     """
     @wraps(handler)
     async def guarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat
         if not chat or chat.type != ChatType.PRIVATE:
             logger.info("Ignoring %s outside private chat", handler.__name__)
+            return
+        if not is_admin(update):
+            logger.info("Ignoring %s from non-admin %s", handler.__name__,
+                        update.effective_user.id if update.effective_user else None)
             return
         return await handler(update, context)
 
