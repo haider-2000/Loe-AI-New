@@ -13,7 +13,7 @@ class Settings:
     telegram_bot_token: str
     gemini_api_key: str
     admin_id: int
-    gemini_model: str = "gemini-3.7-flash"
+    gemini_model: str = "gemini-3.5-flash-lite"
     database_path: str = "data/edu_bot.db"
     max_download_bytes: int = 20 * 1024 * 1024
     max_message_chars: int = 12000
@@ -33,7 +33,7 @@ class Settings:
             telegram_bot_token=token,
             gemini_api_key=gemini_key,
             admin_id=int(admin_raw),
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.7-flash").strip() or "gemini-3.7-flash",
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip() or "gemini-3.5-flash-lite",
             # DB_URL wins: on Render it points at a remote database, because the
             # container disk there is wiped on every restart. A libsql:// value
             # lands in the same field as a plain local path.

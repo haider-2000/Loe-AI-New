@@ -40,7 +40,10 @@ services:
       # Set to 0 to turn the automatic backup off.
       - key: AUTO_BACKUP_MINUTES
         value: "15"
-      # These two have working defaults in config.py:
-      #   GEMINI_MODEL    -> gemini-3.7-flash
+      # The lite model: the larger ones were returning 429/503 from this account.
+      # gemini_client.py still falls back to the rest of the chain on failure.
+      - key: GEMINI_MODEL
+        value: "gemini-3.5-flash-lite"
+      # This one has a working default in config.py:
       #   DATABASE_PATH   -> data/edu_bot.db
       # PORT is supplied by Render and is read by bot.py.
