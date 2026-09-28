@@ -88,6 +88,26 @@ class GeminiUnavailableError(RuntimeError):
     """Every configured model was temporarily unavailable (capacity/quota)."""
 
 
+class GeminiQuotaError(GeminiUnavailableError):
+    """The account's quota for these models is zero, so retrying cannot help.
+
+    The API reports a zero free-tier limit as RESOURCE_EXHAUSTED and even
+    suggests a retry delay, which reads like a busy service but is a plan
+    wall: no amount of waiting changes a limit of 0.
+    """
+
+
+# A quota of 0 cannot be waited out, unlike a per-minute limit that is simply
+# used up. The message text is the only place the limit itself is reported, and
+# the 0 has to be the whole number: "limit: 0.5" is a real limit.
+_ZERO_QUOTA_RE = re.compile(r"limit:\s*0(?![\d.])", re.IGNORECASE)
+
+
+def _is_quota_wall(exc: Exception) -> bool:
+    """True when the model is refused outright rather than momentarily busy."""
+    return bool(_ZERO_QUOTA_RE.search(str(exc)))
+
+
 def _strip_label(text: str, label: str) -> str:
     """Drop a leading 'LABEL:' prefix so raw scaffolding never reaches the user."""
     cleaned = re.sub(rf"^\s*{label}\s*:", "", text, flags=re.IGNORECASE)
@@ -146,6 +166,7 @@ class GeminiClient:
         the caller decides what counts as a usable reply.
         """
         last: Exception | None = None
+        wall = True
         gate = _call_gate()
         for index, model in enumerate(models):
             try:
@@ -156,6 +177,8 @@ class GeminiClient:
                 if not _is_unavailable(exc):
                     raise
                 last = exc
+                if not _is_quota_wall(exc):
+                    wall = False
                 logger.warning("Model %s unavailable (%s: %s), trying fallback",
                                model, type(exc).__name__, _brief(exc))
                 if index < len(models) - 1:
@@ -164,6 +187,12 @@ class GeminiClient:
             if index:
                 logger.info("Answered using fallback model %s", model)
             return _response_text(response), response
+        if wall:
+            # Every model was refused with a zero limit, so the chain is not
+            # worth walking again until the account changes.
+            raise GeminiQuotaError(
+                f"No quota for any of {', '.join(models)}; last error: {_brief(last)}"
+            ) from last
         raise GeminiUnavailableError(
             f"All Gemini models unavailable; last error: {_brief(last)}") from last
 

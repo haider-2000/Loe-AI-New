@@ -26,10 +26,16 @@ from database import (count_by_status, create_lesson, enroll_student, image_name
                       is_remote, lesson_roster, list_lessons, load_image, pending_rows,
                       set_privacy_flag, snapshot_database, store_image)
 from dataset import export_dataset, save_image, save_text, save_voice_transcription
-from gemini_client import GeminiClient, GeminiUnavailableError
+from gemini_client import GeminiClient, GeminiQuotaError, GeminiUnavailableError
 from memory import ConversationMemory
 
 BUSY_MESSAGE = "الخدمة مشغولة حالياً لأن ضغط الطلبات عالية. حاول بعد دقيقة."
+
+# Sent when the account has no quota left for a model at all. Telling a student
+# to come back in a minute would be a lie here: a limit of 0 does not refill.
+QUOTA_MESSAGE = "هذه الخدمة مو متوفرة على الحساب حالياً، فما أگدر أنفّذ الطلب. جرّب السؤال النصي."
+IMAGE_QUOTA_MESSAGE = ("خدمة رسم الصور مو متوفرة على الحساب حالياً. "
+                       "أسؤالك النصية والصور والصوت تشتغل عادي.")
 
 # A local file already survives on the laptop, so the image bytes only need a
 # second home when the database lives somewhere ephemeral, like a Render container.
@@ -499,6 +505,10 @@ async def draw_and_send(message, description: str) -> None:
         return
     try:
         data, mime_type, caption = await ai.generate_image(description)
+    except GeminiQuotaError:
+        logger.error("No quota for any drawing model; the account needs billing")
+        await message.reply_text(IMAGE_QUOTA_MESSAGE)
+        return
     except GeminiUnavailableError:
         logger.warning("All Gemini image models are busy")
         await message.reply_text(BUSY_MESSAGE)
@@ -552,6 +562,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             memory.remember(*key, text, answer)
         await save_text(settings.database_path, text, answer, "data/raw/text")
         await reply_answer(message, answer)
+    except GeminiQuotaError:
+        logger.error("No quota for any model; the account needs billing")
+        await message.reply_text(QUOTA_MESSAGE)
     except GeminiUnavailableError:
         logger.warning("All Gemini models are busy; answering %s later", settings.gemini_model)
         await message.reply_text(BUSY_MESSAGE)
@@ -602,6 +615,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             except Exception:
                 logger.exception("Could not store the image in the database")
         await reply_answer(message, answer)
+    except GeminiQuotaError:
+        logger.error("No quota for any model while handling a photo")
+        if local_path.exists():
+            local_path.unlink(missing_ok=True)
+        await message.reply_text(QUOTA_MESSAGE)
     except GeminiUnavailableError:
         logger.warning("All Gemini models are busy while handling a photo")
         if local_path.exists():
@@ -636,6 +654,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             memory.remember(*key, transcription or "[رسالة صوتية]", answer)
         await save_voice_transcription(settings.database_path, transcription, answer)
         await reply_answer(message, answer)
+    except GeminiQuotaError:
+        logger.error("No quota for any model while handling a voice note")
+        await message.reply_text(QUOTA_MESSAGE)
     except GeminiUnavailableError:
         logger.warning("All Gemini models are busy while handling a voice note")
         await message.reply_text(BUSY_MESSAGE)
