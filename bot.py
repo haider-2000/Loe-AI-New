@@ -16,15 +16,17 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType
-from telegram.error import RetryAfter
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import RetryAfter, TelegramError
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+                          MessageHandler, filters)
 
 from config import Settings
-from database import (count_by_status, create_lesson, enroll_student, image_names, init_db,
-                      is_remote, lesson_roster, list_lessons, load_image, pending_rows,
-                      set_privacy_flag, snapshot_database, store_image)
+from database import (count_by_status, create_lesson, create_quiz_session, enroll_student,
+                      get_quiz_session, image_names, init_db, is_remote, lesson_roster,
+                      list_lessons, load_image, pending_rows, quiz_history, quiz_overall,
+                      record_quiz_answer, set_privacy_flag, snapshot_database, store_image)
 from dataset import export_dataset, save_image, save_text, save_voice_transcription
 from gemini_client import GeminiClient, GeminiQuotaError, GeminiUnavailableError
 from memory import ConversationMemory
@@ -231,8 +233,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @allowed_chat_only
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "الأوامر المتاحة:\n/start - بدء الاستخدام\n/help - المساعدة\n/privacy - الخصوصية\n/status - حالة الخدمة\n/forget - نسيان آخر المواضيع\n/cancel - إلغاء العملية الحالية\n"
+        "الأوامر المتاحة:\n/start - بدء الاستخدام\n/help - المساعدة\n/privacy - الخصوصية\n/status - حالة الخدمة\n/quiz الموضوع - اختبار\n/progress - نتائجك\n/forget - نسيان آخر المواضيع\n/cancel - إلغاء العملية الحالية\n"
         "بالمجموعة ما أرد على كل الرسائل؛ اكتب اسمي (leo أو ليو) بالسؤال، أو رد على رسالتي.\n\n"
+        "وتكتب /quiz تطلع لك قائمة باختصاصات الذكاء الاصطناعي تختار منها، أو تكتب /quiz الموضوع مباشرة مثل /quiz تعلم الآلة.\n"
+        "كل اختبار ٥ أسئلة اختيار من متعدد، تجاوب بالأزرار (أ ب ج د) وتعرف النتيجة مع شرح ليش جوابك صح أو غلط.\n"
+        "النتائج تنحفظ لكل طالب لحاله وتگدر تشوفها بـ /progress.\n\n"
         "أتذكر آخر ٥ أسئلة وجواباتها منك فقط (لكل مجموعة على حدة) عشان تكمل بنفس الموضوع. "
         "هذه الذاكرة مؤقتة بالجهاز وما تنحفظ بالداتابيز، وبتقدر تمسحها بـ /forget.\n\n"
         "تنظيم الحصص (للمدير):\n/newlesson العنوان | التاريخ | الوقت | السعة\n"
@@ -688,6 +693,219 @@ async def auto_backup_loop(telegram_bot: Any, minutes: int) -> None:
             logger.exception("Automatic backup failed")
 
 
+# The exam topics offered as buttons. The label is short enough for a phone
+# screen; the topic is what actually goes to the model, so it can be more
+# precise than the button says. Kept to eight so the menu stays two columns.
+QUIZ_TOPICS: tuple[tuple[str, str], ...] = (
+    ("الذكاء الاصطناعي", "أسس الذكاء الاصطناعي: تعريفه، فروعه، تطبيقاته، وأهميته"),
+    ("تعلم الآلة", "تعلم الآلة: أنواع التعلم، التدريب، التقييم، والتحسين"),
+    ("التعلم العميق", "التعلم العميق: الشبكات العصبية، الطبقات، والتدريب"),
+    ("معالجة اللغة", "معالجة اللغة الطبيعية: التوكنيز، تمثيل النص، والمهام اللغوية"),
+    ("الرؤية الحاسوبية", "الرؤية الحاسوبية: الصور، كشف الأجسام، والتعرف على الأنماط"),
+    ("الذكاء التوليدي", "الذكاء الاصطناعي التوليدي: النماذج التوليدية، النصوص والصور"),
+    ("البيانات الضخمة", "البيانات الضخمة: التخزين، التحليل، وأدوات المعالجة"),
+    ("أخلاقيات الذكاء", "أخلاقيات الذكاء الاصطناعي: الخصوصية، التحيّز، والمسؤولية"),
+)
+QUIZ_LETTERS = ("أ", "ب", "ج", "د")
+
+
+def quiz_menu() -> InlineKeyboardMarkup:
+    """A button per exam topic, two to a row."""
+    buttons = [InlineKeyboardButton(label, callback_data=f"qtopic:{index}")
+               for index, (label, _topic) in enumerate(QUIZ_TOPICS)]
+    return InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+
+
+def question_keyboard(session_id: int, index: int) -> InlineKeyboardMarkup:
+    """One row of answer buttons, one letter each.
+
+    The options are written in the message rather than the button, because a
+    long option would either be cut off or push the whole row off screen.
+    """
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(letter, callback_data=f"qa:{session_id}:{index}:{letter}")
+        for letter in QUIZ_LETTERS]])
+
+
+def render_question(topic: str, questions: list[dict], index: int) -> str:
+    """The question and its options as the student sees them."""
+    item = questions[index]
+    lines = [f"📝 {item['question']}", ""]
+    for letter, option in zip(QUIZ_LETTERS, item["options"]):
+        lines.append(f"{letter}) {option}")
+    lines.append("")
+    lines.append(f"الموضوع: {topic}  •  سؤال {index + 1} من {len(questions)}")
+    return "\n".join(lines)
+
+
+async def start_quiz(message, topic: str, user) -> None:
+    """Generate an exam on a topic and ask the first question.
+
+    The student is passed in rather than read off the message: when the exam
+    starts from a button the message is the bot's own, so its author would
+    otherwise be the bot and the student would own nothing they could answer.
+    """
+    status = await message.reply_text(f"🧠 أكتّب اختبار على «{topic}»...")
+    try:
+        questions = await ai.make_quiz(topic)
+    except GeminiQuotaError:
+        logger.error("No quota for any model while writing a quiz")
+        await message.reply_text(QUOTA_MESSAGE)
+        return
+    except GeminiUnavailableError:
+        logger.warning("All Gemini models are busy while writing a quiz")
+        await message.reply_text(BUSY_MESSAGE)
+        return
+    except Exception:
+        logger.exception("Quiz generation failed")
+        await message.reply_text("ما كدرت أكتب اختبار هلح. جرّب بعد شوية.")
+        return
+    if not questions:
+        # An unparsable answer is a model problem, not the student's fault, so
+        # it is not worth charging them a retry.
+        logger.warning("Quiz generator returned nothing usable for topic %r", topic)
+        await message.reply_text("ما كدرت أجمع اختبار مفيد على هذا الموضوع. "
+                                 "جرّب تكتب الموضوع بشكل أوضح.")
+        return
+
+    session_id = await create_quiz_session(
+        settings.database_path, chat_id=message.chat.id, user_id=user.id, topic=topic,
+        questions=json.dumps(questions, ensure_ascii=False), total=len(questions))
+    await status.edit_text(f"🧠 اختبار «{topic}» — {len(questions)} أسئلة. يلاّ نبدأ!")
+    await message.reply_text(render_question(topic, questions, 0),
+                             reply_markup=question_keyboard(session_id, 0))
+
+
+@allowed_chat_only
+async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start an exam, either on a topic the student types or from the menu."""
+    message = update.effective_message
+    args = context.args or []
+    if not args:
+        await message.reply_text("شنو الموضوع اللي تريد اختبار؟ "
+                                 "اكتبه بعد الأمر، أو اختار من القائمة:",
+                                 reply_markup=quiz_menu())
+        return
+    topic = " ".join(args).strip()[:120]
+    if not topic:
+        await message.reply_text("اكتب اسم الموضوع بعد الأمر، مثل: /quiz تعلم الآلة")
+        return
+    await start_quiz(message, topic, message.from_user)
+
+
+async def quiz_topic_picked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    message = query.message
+    if message.chat.type == ChatType.PRIVATE and not is_admin(update):
+        return
+    try:
+        index = int(query.data.split(":", 1)[1])
+        _label, topic = QUIZ_TOPICS[index]
+    except (IndexError, ValueError):
+        logger.warning("Bad quiz topic callback: %r", query.data)
+        await message.reply_text("ما فهمت أي موضوع. أرسل /quiz وحيدر اختيارات.")
+        return
+    # The exam belongs to whoever tapped the button, not to the bot that
+    # posted the menu, so the student is the one answering their own exam.
+    await start_quiz(message, topic, query.from_user)
+
+
+async def quiz_answered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Grade one answer, explain it, and move to the next question."""
+    query = update.callback_query
+    try:
+        _prefix, session_raw, index_raw, letter = query.data.split(":")
+        session_id, index = int(session_raw), int(index_raw)
+    except (ValueError, AttributeError):
+        await query.answer()
+        return
+    if letter not in QUIZ_LETTERS:
+        await query.answer()
+        return
+    message = query.message
+    session = await get_quiz_session(settings.database_path, session_id)
+    if session is None:
+        await query.answer("انتهى هذا الاختبار، أرسل /quiz لبداية جديد.", show_alert=True)
+        return
+    # Only the student who started the exam may answer it, and only in the chat
+    # it was started in, so a busy group cannot answer on someone else's behalf.
+    if query.from_user.id != session["user_id"] or message.chat.id != session["chat_id"]:
+        await query.answer("هذا الاختبار مو إلك.", show_alert=True)
+        return
+    try:
+        questions = json.loads(session["questions"])
+    except json.JSONDecodeError:
+        await query.answer("ما أگدر أقرأ الاختبار. أرسل /quiz من جديد.", show_alert=True)
+        return
+    if not 0 <= index < len(questions):
+        await query.answer("هذا السؤال ما موجود.", show_alert=True)
+        return
+    # A replayed tap must not be graded twice, so the banked count is checked
+    # before anything is written.
+    if index < session["answered"]:
+        await query.answer("هالجواب انقبل خلّص.", show_alert=True)
+        return
+
+    item = questions[index]
+    chosen = QUIZ_LETTERS.index(letter)
+    correct = chosen == item["answer"]
+    await query.answer("صحيح ✅" if correct else "غلط ❌")
+    updated = await record_quiz_answer(settings.database_path, session_id, correct)
+    verdict = "✅ إجابة صحيحة" if correct else "❌ غلط"
+    if not correct:
+        verdict += f" — الجواب الصحيح: {QUIZ_LETTERS[item['answer']]}) {item['options'][item['answer']]}"
+    body = f"{verdict}\n\n{item['explanation']}"
+    try:
+        await query.edit_message_text(body, reply_markup=None)
+    except TelegramError:
+        # A repeated tap on the same answer changes nothing, so the message is
+        # already correct and there is nothing left to do.
+        logger.debug("Quiz message already graded", exc_info=True)
+
+    if updated and updated["answered"] >= updated["total"]:
+        await finish_quiz(message, session["topic"], updated["score"], updated["total"])
+    elif index + 1 < len(questions):
+        await message.reply_text(render_question(session["topic"], questions, index + 1),
+                                 reply_markup=question_keyboard(session_id, index + 1))
+
+
+async def finish_quiz(message, topic: str, score: int, total: int) -> None:
+    """Report the result once every answer is in."""
+    percent = round(100 * score / total) if total else 0
+    if percent >= 80:
+        comment = "ممتاز 👏 ما شاء الله، فاهم الموضوع زين."
+    elif percent >= 50:
+        comment = "جيّد 👍 شوية تركيز وراح تكوّن أحسن."
+    else:
+        comment = "تحتاج مراجعة 💪 راجع الموضوع وگرّب مرة ثانية."
+    await message.reply_text(
+        f"🏁 انتهى اختبار «{topic}»\n\n"
+        f"النتيجة: {score} من {total}  ({percent}%)\n{comment}\n\n"
+        "شنو تريد؟ /quiz لاختبار جديد، /progress لنتائجك كلها.")
+
+
+@allowed_chat_only
+async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show this student's own exam history and totals."""
+    message = update.effective_message
+    user = message.from_user
+    totals = await quiz_overall(settings.database_path, message.chat.id, user.id)
+    if not totals["quizzes"]:
+        await message.reply_text("ما أچت أي اختبار بعد. أرسل /quiz وابدأ أول اختبار إلك.")
+        return
+    history = await quiz_history(settings.database_path, message.chat.id, user.id, limit=8)
+    percent = round(100 * totals["correct"] / totals["answered"]) if totals["answered"] else 0
+    lines = ["📊 نتائجك", "",
+             f"الاختبارات: {totals['quizzes']}",
+             f"الأسئلة المجاوبة: {totals['answered']} من {totals['questions']}",
+             f"الإجابات الصحيحة: {totals['correct']}  ({percent}%)", "", "آخر اختبار:"]
+    for row in history:
+        mark = "✅" if row["finished_at"] else "⏳"
+        lines.append(f"{mark} {row['topic']}: {row['score']} من {row['total']}")
+    await message.reply_text("\n".join(lines))
+
+
 async def post_init(application: Application) -> None:
     global stored_remotely
     for directory in ("data/raw/images", "data/raw/text", "data/exports", "data/backups"):
@@ -733,6 +951,10 @@ def main() -> None:
     application.add_handler(CommandHandler("backup", backup))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("forget", forget))
+    application.add_handler(CommandHandler("quiz", quiz))
+    application.add_handler(CommandHandler("progress", progress))
+    application.add_handler(CallbackQueryHandler(quiz_topic_picked, pattern=r"^qtopic:"))
+    application.add_handler(CallbackQueryHandler(quiz_answered, pattern=r"^qa:"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

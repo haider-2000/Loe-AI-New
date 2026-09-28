@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections.abc import Sequence
@@ -51,6 +52,85 @@ RETRYABLE_CODES = {429, 500, 502, 503, 504}
 # A busy group can fire many requests at once; this keeps us inside the API's
 # per-minute quota instead of letting every caller burst at the same moment.
 MAX_CONCURRENT_CALLS = 8
+
+QUIZ_QUESTION_COUNT = 5
+
+# The exam generator gets its own prompt rather than the tutor persona: a tutor
+# asked for JSON tends to wrap it in prose, and prose has to be salvaged or
+# thrown away. Only the explanations are written in Iraqi Arabic, because those
+# are the part a student actually reads.
+QUIZ_PROMPT = """You write multiple-choice exam questions for Iraqi students.
+
+Return ONLY a JSON array, with nothing before or after it, of exactly {count}
+objects. Each object must have exactly these keys:
+  "question": the question text
+  "options": an array of exactly 4 distinct answer strings
+  "answer": the index of the correct option, as a number from 0 to 3
+  "explanation": one or two sentences, in Iraqi Arabic, saying why that option
+    is right and, when it helps, why the tempting wrong one is wrong
+
+Rules:
+- One clearly correct answer. Never "all of the above" or "none of the above".
+- Distractors must be plausible to a student who half knows the topic.
+- Vary the difficulty across the {count} questions.
+- Do not number the questions and do not repeat one.
+- Keep each question under 300 characters.
+- If the topic is too vague for a real exam, still write the {count} best
+  general questions about it.
+
+Topic: {topic}
+"""
+
+
+def _parse_quiz(text: str, count: int = QUIZ_QUESTION_COUNT) -> list[dict[str, Any]]:
+    """Read the model's JSON array, tolerating the usual ways it comes back.
+
+    Models wrap JSON in prose or a code fence, answer 1-based instead of
+    0-based, or return fewer questions than asked for. Anything that cannot be
+    read as a real question is dropped rather than put in front of a student.
+    """
+    if not text:
+        return []
+    start, end = text.find("["), text.rfind("]")
+    if start < 0 or end <= start:
+        return []
+    try:
+        raw = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(raw, list):
+        return []
+
+    questions: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question") or "").strip()
+        explanation = str(item.get("explanation") or "").strip()
+        options = item.get("options")
+        if not question or not explanation:
+            continue
+        if not isinstance(options, list) or len(options) < 2:
+            continue
+        choices = [str(option).strip() for option in options if str(option).strip()]
+        if len(choices) < 2 or len(set(choices)) != len(choices):
+            continue
+        try:
+            answer = int(str(item["answer"]).strip())
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        # A 0-based index can never equal the number of options, so that value
+        # means the model counted from 1 and needs shifting back by one.
+        if answer == len(choices):
+            answer -= 1
+        if not 0 <= answer < len(choices):
+            continue
+        questions.append({"question": question[:400],
+                          "options": [option[:200] for option in choices[:4]],
+                          "answer": answer,
+                          "explanation": explanation[:600]})
+    return questions[:count]
+
 
 _gate: asyncio.Semaphore | None = None
 _gate_loop: asyncio.AbstractEventLoop | None = None
@@ -211,6 +291,20 @@ class GeminiClient:
              types.Part.from_bytes(data=image_bytes, mime_type=mime_type)],
             system_prompt=None, allow_empty=True)
         return text.strip().upper().startswith("YES")
+
+    async def make_quiz(self, topic: str,
+                        count: int = QUIZ_QUESTION_COUNT) -> list[dict[str, Any]]:
+        """Write an exam on a topic and return it as ready-to-use questions.
+
+        No conversation history: an exam is not a continuation of anything, and
+        a past answer would only bias the questions. An empty result means the
+        model did not return a usable exam, which the caller reports rather
+        than showing a student a blank paper.
+        """
+        prompt = QUIZ_PROMPT.format(count=count, topic=topic)
+        text = await self._complete([types.Part(text=prompt)], system_prompt=None,
+                                    empty_message="", allow_empty=True)
+        return _parse_quiz(text, count)
 
     async def answer_voice(self, audio_bytes: bytes, mime_type: str,
                            history: Sequence[Turn] = ()) -> tuple[str, str]:

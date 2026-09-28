@@ -54,10 +54,24 @@ CREATE TABLE IF NOT EXISTS images (
     content BLOB NOT NULL,
     stored_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS quiz_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    topic TEXT NOT NULL,
+    questions TEXT NOT NULL,
+    total INTEGER NOT NULL,
+    score INTEGER NOT NULL DEFAULT 0,
+    answered INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_quiz_sessions_student
+    ON quiz_sessions(chat_id, user_id, created_at);
 """
 
 REMOTE_PREFIXES = ("libsql://", "https://", "wss://")
-_TABLES = ("contributions", "lessons", "lesson_students", "images")
+_TABLES = ("contributions", "lessons", "lesson_students", "images", "quiz_sessions")
 
 
 def database_url() -> str:
@@ -485,3 +499,96 @@ async def lesson_roster(url: str, lesson_id: int) -> dict[str, Any] | None:
     return {"id": first["id"], "title": first["title"], "lesson_date": first["lesson_date"],
             "lesson_time": first["lesson_time"], "capacity": first["capacity"],
             "students": [row["student_code"] for row in rows if row["student_code"] is not None]}
+
+
+async def create_quiz_session(url: str, *, chat_id: int, user_id: int, topic: str,
+                              questions: str, total: int) -> int:
+    """Start a quiz and return its id.
+
+    The questions live in the database rather than in memory because the answer
+    buttons come back later as callbacks: a service restart in between, which
+    Render does often, would otherwise leave the student with buttons that no
+    longer mean anything.
+    """
+    created_at = datetime.now(timezone.utc).isoformat()
+    async with _connect(url) as db:
+        cursor = await db.execute(
+            """INSERT INTO quiz_sessions
+            (chat_id, user_id, topic, questions, total, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (chat_id, user_id, topic, questions, total, created_at))
+        await db.commit()
+        return int(cursor.lastrowid)
+
+
+async def get_quiz_session(url: str, session_id: int) -> dict[str, Any] | None:
+    async with _connect(url) as db:
+        rows = await _fetch_all(
+            db,
+            """SELECT id, chat_id, user_id, topic, questions, total, score,
+                      answered, created_at, finished_at
+               FROM quiz_sessions WHERE id = ?""", (session_id,))
+    return rows[0] if rows else None
+
+
+async def record_quiz_answer(url: str, session_id: int, correct: bool) -> dict[str, Any] | None:
+    """Bank one answer and hand back the updated score.
+
+    The update adds to whatever is already banked, so a replayed button tap
+    counts once: a student who presses the same answer twice, or a client that
+    retries, cannot inflate a score. Reaching the total closes the session.
+    """
+    async with _connect(url) as db:
+        cursor = await db.execute(
+            """UPDATE quiz_sessions
+               SET score = score + ?, answered = answered + 1
+               WHERE id = ? AND answered < total""",
+            (int(correct), session_id))
+        await db.commit()
+        if cursor.rowcount == 0:
+            # Either the session is gone or every answer is already in, so the
+            # score must not move.
+            rows = await _fetch_all(
+                db, "SELECT id, score, answered, total, finished_at FROM quiz_sessions WHERE id = ?",
+                (session_id,))
+            return rows[0] if rows else None
+        rows = await _fetch_all(
+            db, "SELECT id, score, answered, total, finished_at FROM quiz_sessions WHERE id = ?",
+            (session_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        if row["answered"] >= row["total"]:
+            await db.execute("UPDATE quiz_sessions SET finished_at = ? WHERE id = ?",
+                             (datetime.now(timezone.utc).isoformat(), session_id))
+            await db.commit()
+            row["finished_at"] = datetime.now(timezone.utc).isoformat()
+        return row
+
+
+async def quiz_history(url: str, chat_id: int, user_id: int,
+                       limit: int = 10) -> list[dict[str, Any]]:
+    async with _connect(url) as db:
+        return await _fetch_all(
+            db,
+            """SELECT topic, score, total, answered, created_at, finished_at
+               FROM quiz_sessions
+               WHERE chat_id = ? AND user_id = ?
+               ORDER BY id DESC LIMIT ?""", (chat_id, user_id, limit))
+
+
+async def quiz_overall(url: str, chat_id: int, user_id: int) -> dict[str, int]:
+    """Totals for one student, which is what /progress reports."""
+    async with _connect(url) as db:
+        rows = await _fetch_all(
+            db,
+            """SELECT COUNT(*) AS quizzes, COALESCE(SUM(total), 0) AS questions,
+                      COALESCE(SUM(score), 0) AS correct,
+                      COALESCE(SUM(answered), 0) AS answered
+               FROM quiz_sessions WHERE chat_id = ? AND user_id = ?""",
+            (chat_id, user_id))
+    row = rows[0] if rows else {}
+    return {"quizzes": int(row.get("quizzes") or 0),
+            "questions": int(row.get("questions") or 0),
+            "correct": int(row.get("correct") or 0),
+            "answered": int(row.get("answered") or 0)}
