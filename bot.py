@@ -223,28 +223,32 @@ def thread_key(update: Update) -> tuple[int, int] | None:
 
 
 PAUSED_FLAG = "paused"
-# The pause flag is read on every student update, so it is cached in the
-# process after the first lookup. The flag itself is written to the database,
-# which is what makes a pause survive a restart; this cache only saves the
-# round trip, and the single Render instance owns the truth.
-_paused: bool | None = None
+# A pause belongs to the chat it was typed in, not to the whole bot: the same
+# bot can be wanted in one group and quiet in another. The per-chat truth is
+# written to the database so a restart does not undo a pause; this cache only
+# saves the round trip, and the single Render instance owns the truth.
+_paused: dict[int, bool] = {}
 
 
-async def is_paused() -> bool:
-    global _paused
-    if _paused is None:
-        _paused = (await read_flag(settings.database_path, PAUSED_FLAG)) == "1"
-    return _paused
+def _pause_flag(chat_id: int) -> str:
+    return f"{PAUSED_FLAG}:{chat_id}"
 
 
-async def set_paused(paused: bool) -> None:
-    global _paused
-    _paused = paused
-    await write_flag(settings.database_path, PAUSED_FLAG, "1" if paused else "0")
+async def is_paused(chat_id: int) -> bool:
+    if chat_id not in _paused:
+        _paused[chat_id] = (await read_flag(settings.database_path,
+                                           _pause_flag(chat_id))) == "1"
+    return _paused[chat_id]
+
+
+async def set_paused(chat_id: int, paused: bool) -> None:
+    _paused[chat_id] = paused
+    await write_flag(settings.database_path, _pause_flag(chat_id),
+                     "1" if paused else "0")
 
 
 def active_only(handler):
-    """Stay completely silent while the bot is paused.
+    """Stay completely silent in a chat that is paused.
 
     A student must not be able to tell a paused bot from an offline one, so
     nothing is sent at all: no reply, no hint, no Gemini call. /start is the one
@@ -252,7 +256,8 @@ def active_only(handler):
     """
     @wraps(handler)
     async def guarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if await is_paused():
+        chat = update.effective_chat
+        if chat is not None and await is_paused(chat.id):
             return
         return await handler(update, context)
 
@@ -261,30 +266,35 @@ def active_only(handler):
 
 @allowed_chat_only
 async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stop answering everybody until somebody runs /start.
+    """Stop answering in this chat until somebody here runs /start.
 
-    Open to any member on purpose: the group is the bot's only audience, and the
+    Open to any member on purpose: the group is the bot's audience, and the
     owner asked for the switch to be a group decision rather than a private one.
     The pause is still durable, so a mistaken press is undone with /start and
-    never by a restart.
+    never by a restart. Other chats are untouched.
     """
     message = update.effective_message
-    if await is_paused():
-        await message.reply_text("البوت مسكوت أصلاً. أرسل /start يرجّعه.")
+    chat_id = update.effective_chat.id
+    if await is_paused(chat_id):
+        await message.reply_text("البوت مسكوت بهالمحادثة أصلاً. أرسل /start يرجّعه.")
         return
-    await set_paused(True)
-    logger.warning("Bot paused by user %s; everyone gets silence until /start",
-                   update.effective_user.id)
-    await message.reply_text("سكّيت البوت. ما راح يرد على أحد لحد ما أحد يرسل /start.")
+    await set_paused(chat_id, True)
+    logger.warning("Bot paused in chat %s by user %s; silence there until /start",
+                   chat_id, update.effective_user.id)
+    await message.reply_text(
+        "سكّيت البوت بهالمحادثة بس. باقي المحادثات تضل تشتغل، "
+        "وأول ما أحد هنا يرسل /start يرجع يرد.")
 
 
 @allowed_chat_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await is_paused():
-        # Anyone can bring the bot back, which is what makes the pause a
-        # temporary switch rather than a setting only the owner controls.
-        await set_paused(False)
-        logger.warning("Bot resumed by /start from %s", update.effective_user.id)
+    chat_id = update.effective_chat.id
+    if await is_paused(chat_id):
+        # Anyone in that chat can bring it back, which is what makes the pause
+        # temporary rather than a setting only the owner controls.
+        await set_paused(chat_id, False)
+        logger.warning("Bot resumed in chat %s by /start from %s",
+                       chat_id, update.effective_user.id)
         await update.effective_message.reply_text(
             "رجّعت البوت، وياك راح يرد على الكل من هالحين. اسأل براحتك!")
         return
@@ -303,7 +313,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "وتكتب /quiz تطلع لك قائمة باختصاصات الذكاء الاصطناعي تختار منها، أو تكتب /quiz الموضوع مباشرة مثل /quiz تعلم الآلة.\n"
         "كل اختبار ٥ أسئلة اختيار من متعدد، تجاوب بالأزرار (أ ب ج د) وتعرف النتيجة مع شرح ليش جوابك صح أو غلط.\n"
         "النتائج تنحفظ لكل طالب لحاله وتگدر تشوفها بـ /progress.\n\n"
-        "و anyone يگدر يسكّت البوت بـ/pause، ويرجع يرد أول ما أحد يرسل /start.\n\n"
+        "و anyone يگدر يسكّت البوت بهالمحادثة بـ/pause، ويرجع يرد أول ما أحد من هنا يرسل /start.\n\n"
         "أتذكر آخر ٥ أسئلة وجواباتها منك فقط (لكل مجموعة على حدة) عشان تكمل بنفس الموضوع. "
         "هذه الذاكرة مؤقتة بالجهاز وما تنحفظ بالداتابيز، وبتقدر تمسحها بـ /forget.\n\n"
         "تنظيم الحصص (للمدير):\n/newlesson العنوان | التاريخ | الوقت | السعة\n"
@@ -335,11 +345,11 @@ async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @allowed_chat_only
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await is_paused():
+    if await is_paused(update.effective_chat.id):
         # Saying "the service is running" here would be the same lie as
         # promising a retry on a dead quota, so the pause is reported instead.
         await update.effective_message.reply_text(
-            "البوت مسكوت حالياً. يرجع يرد أول ما أحد يرسل /start.")
+            "البوت مسكوت بهالمحادثة حالياً. يرجع يرد أول ما أحد هنا يرسل /start.")
         return
     counts = await count_by_status(settings.database_path)
     summary = ", ".join(f"{key}: {value}" for key, value in sorted(counts.items())) or "لا توجد إدخالات بعد"
