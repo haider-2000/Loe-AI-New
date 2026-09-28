@@ -261,15 +261,20 @@ def active_only(handler):
 
 @allowed_chat_only
 async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stop answering students until somebody runs /start."""
-    if not is_admin(update):
-        return
+    """Stop answering everybody until somebody runs /start.
+
+    Open to any member on purpose: the group is the bot's only audience, and the
+    owner asked for the switch to be a group decision rather than a private one.
+    The pause is still durable, so a mistaken press is undone with /start and
+    never by a restart.
+    """
     message = update.effective_message
     if await is_paused():
         await message.reply_text("البوت مسكوت أصلاً. أرسل /start يرجّعه.")
         return
     await set_paused(True)
-    logger.warning("Bot paused by the admin; students get silence until /start")
+    logger.warning("Bot paused by user %s; everyone gets silence until /start",
+                   update.effective_user.id)
     await message.reply_text("سكّيت البوت. ما راح يرد على أحد لحد ما أحد يرسل /start.")
 
 
@@ -298,7 +303,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "وتكتب /quiz تطلع لك قائمة باختصاصات الذكاء الاصطناعي تختار منها، أو تكتب /quiz الموضوع مباشرة مثل /quiz تعلم الآلة.\n"
         "كل اختبار ٥ أسئلة اختيار من متعدد، تجاوب بالأزرار (أ ب ج د) وتعرف النتيجة مع شرح ليش جوابك صح أو غلط.\n"
         "النتائج تنحفظ لكل طالب لحاله وتگدر تشوفها بـ /progress.\n\n"
-        "وللمدير: /pause يسكت البوت لحد ما أحد يرسل /start، فيرجع يرد على الكل.\n\n"
+        "و anyone يگدر يسكّت البوت بـ/pause، ويرجع يرد أول ما أحد يرسل /start.\n\n"
         "أتذكر آخر ٥ أسئلة وجواباتها منك فقط (لكل مجموعة على حدة) عشان تكمل بنفس الموضوع. "
         "هذه الذاكرة مؤقتة بالجهاز وما تنحفظ بالداتابيز، وبتقدر تمسحها بـ /forget.\n\n"
         "تنظيم الحصص (للمدير):\n/newlesson العنوان | التاريخ | الوقت | السعة\n"
