@@ -33,9 +33,7 @@ BUSY_MESSAGE = "الخدمة مشغولة حالياً لأن ضغط الطلب�
 
 # Sent when the account has no quota left for a model at all. Telling a student
 # to come back in a minute would be a lie here: a limit of 0 does not refill.
-QUOTA_MESSAGE = "هذه الخدمة مو متوفرة على الحساب حالياً، فما أگدر أنفّذ الطلب. جرّب السؤال النصي."
-IMAGE_QUOTA_MESSAGE = ("خدمة رسم الصور مو متوفرة على الحساب حالياً. "
-                       "أسؤالك النصية والصور والصوت تشتغل عادي.")
+QUOTA_MESSAGE = "الخدمة مو متوفرة على الحساب حالياً، فما أگدر أنفّذ الطلب. جرّب بعدين."
 
 # A local file already survives on the laptop, so the image bytes only need a
 # second home when the database lives somewhere ephemeral, like a Render container.
@@ -209,63 +207,6 @@ def clean_prompt(text: str, bot_username: str = "") -> str:
     return text[: settings.max_message_chars]
 
 
-# Asking for a drawing, said the way a student actually says it. "سوي" alone is
-# far too broad (سوي حساب), so the drawing words only count together with
-# "صورة"; a drawing verb on its own is enough. Latin verbs need a word boundary
-# so that "drawing" is not read as a request to draw.
-_IMAGE_PHRASES = (
-    "سوي صورة", "سوّي صورة", "سو صورة", "سويلي صورة", "سوي صورة لي",
-    "اعمل صورة", "أعمل صورة", "أعمللك صورة", "ابشر صورة", "أبشر صورة",
-    "ابشرلنا صورة", "أبشرلنا صورة", "اريد صورة", "أريد صورة", "ابي صورة",
-    "أبي صورة", "ابغى صورة", "أبغى صورة", "سوي رسمة", "ارسم رسمة",
-    "generate an image", "generate a picture", "make an image", "make a picture",
-    "create an image", "create a picture",
-)
-_IMAGE_VERBS = ("ارسم", "أرسم", "ارسملي", "أرسملي", "اريد اني ارسم", "ابي ارسم")
-_IMAGE_TRIGGERS = tuple(sorted(_IMAGE_PHRASES + _IMAGE_VERBS, key=len, reverse=True))
-_LATIN_DRAW_RE = re.compile(r"\b(?:draw|paint)\b", re.IGNORECASE)
-_TRIGGER_TAIL = " :،,-–—"
-# Telegram commands have to be plain Latin names, so the Arabic spellings of
-# /image are matched as text instead. Registered ahead of the plain-text handler.
-ARABIC_IMAGE_COMMAND = r"^/(?:صورة|صوره|ارسم|رسمة)"
-# "draw" is handled by the regex instead of the phrase list, so that a real
-# request like "draw a volcano" keeps its whole description; this only trims
-# the politeness off "draw me a castle".
-_LATIN_FILLER_RE = re.compile(r"^(?:me|for\s+me)\b\s*", re.IGNORECASE)
-
-
-def image_request(text: str) -> str | None:
-    """Return the description when a message asks for a picture to be drawn.
-
-    The description is what follows the request, so "ارسم دائرة وحدة" draws the
-    circle rather than the words. When nothing follows, the whole message is the
-    description: "ارسم" alone is still a picture request.
-    """
-    cleaned = " ".join(text.split()).strip()
-    if not cleaned:
-        return None
-    lowered = cleaned.lower()
-    # The earliest trigger wins, and the longest one at that spot, so that
-    # "ارسملي" is not cut short by the "ارسم" inside it.
-    best: tuple[int, int, str] | None = None
-    for trigger in _IMAGE_TRIGGERS:
-        position = lowered.find(trigger)
-        if position < 0:
-            continue
-        candidate = (position, -len(trigger), trigger)
-        if best is None or candidate < best:
-            best = candidate
-    if best is not None:
-        position, _negated, trigger = best
-        description = cleaned[position + len(trigger):].strip(_TRIGGER_TAIL).strip()
-        return description or cleaned
-    match = _LATIN_DRAW_RE.search(cleaned)
-    if match:
-        description = cleaned[match.end():].strip(_TRIGGER_TAIL).strip()
-        return _LATIN_FILLER_RE.sub("", description).strip(_TRIGGER_TAIL).strip() or cleaned
-    return None
-
-
 def thread_key(update: Update) -> tuple[int, int] | None:
     """Identify whose memory this update belongs to, or None if it is unknown.
 
@@ -283,18 +224,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "هلا بيك! آني Leo، كيف أساعدك اليوم؟ "
         "دز سؤالك بالنص، صورة، أو رسالة صوتية، ووجّهها إليّ بالمجموعة بكتابة اسمي (leo أو ليو) أو بالرد على رسالتي. "
-        "أتذكر آخر ٥ أسئلة منك، فتكدر تسأل «والثاني؟» وتكمل بنفس الموضوع. "
-        "وكذلك أكدر أسويلك صور: اكتب «ارسم» أو «سوي صورة» ووصفها."
+        "أتذكر آخر ٥ أسئلة منك، فتكدر تسأل «والثاني؟» وتكمل بنفس الموضوع."
     )
 
 
 @allowed_chat_only
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "الأوامر المتاحة:\n/start - بدء الاستخدام\n/help - المساعدة\n/privacy - الخصوصية\n/status - حالة الخدمة\n/image الوصف - أسوي صورة\n/forget - نسيان آخر المواضيع\n/cancel - إلغاء العملية الحالية\n"
+        "الأوامر المتاحة:\n/start - بدء الاستخدام\n/help - المساعدة\n/privacy - الخصوصية\n/status - حالة الخدمة\n/forget - نسيان آخر المواضيع\n/cancel - إلغاء العملية الحالية\n"
         "بالمجموعة ما أرد على كل الرسائل؛ اكتب اسمي (leo أو ليو) بالسؤال، أو رد على رسالتي.\n\n"
-        "تقدر تكتب «leo ارسم دائرة وحدة» أو «أعمل صورة لدورة الشمس»، أو تستخدم الأمر /image أو /ارسم مع وصف الصورة. "
-        "الصورة تجي كصورة بالدردشة وما تنحفظ بالداتابيز.\n\n"
         "أتذكر آخر ٥ أسئلة وجواباتها منك فقط (لكل مجموعة على حدة) عشان تكمل بنفس الموضوع. "
         "هذه الذاكرة مؤقتة بالجهاز وما تنحفظ بالداتابيز، وبتقدر تمسحها بـ /forget.\n\n"
         "تنظيم الحصص (للمدير):\n/newlesson العنوان | التاريخ | الوقت | السعة\n"
@@ -492,54 +430,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("تم الإلغاء. دز سؤال جديد بأي وقت.")
 
 
-async def draw_and_send(message, description: str) -> None:
-    """Ask the drawing model for a picture and post it back to the chat.
-
-    A generated picture is never written into the dataset: it is the model's
-    own output, not something a student contributed, and the review queue is
-    meant to hold real teaching material. Telegram already hands the student
-    the file, so nothing needs to be kept on our side.
-    """
-    if not description:
-        await message.reply_text("اكتب وصف الصورة بعد الأمر، مثل: /image طائرة يطير فوق المدرسة")
-        return
-    try:
-        data, mime_type, caption = await ai.generate_image(description)
-    except GeminiQuotaError:
-        logger.error("No quota for any drawing model; the account needs billing")
-        await message.reply_text(IMAGE_QUOTA_MESSAGE)
-        return
-    except GeminiUnavailableError:
-        logger.warning("All Gemini image models are busy")
-        await message.reply_text(BUSY_MESSAGE)
-        return
-    except Exception:
-        logger.exception("Image generation failed")
-        await message.reply_text("ما كدرت أسوي صورة حالياً. جرّب وصف أقصر وجرّب مرة ثانية.")
-        return
-    if not data:
-        await message.reply_text("ما رجعت صورة. جرّب توصف الشكل بأوضح.")
-        return
-    logger.info("Drew a %s picture for a %s-character description",
-                mime_type, len(description))
-    try:
-        # Telegram accepts the raw bytes and works the type out for itself.
-        await message.reply_photo(photo=data, caption=caption[:900])
-    except Exception:
-        logger.exception("Could not send the generated image")
-        await message.reply_text("سويت الصورة بس ما كدرت أرسلها. جرّب مرة ثانية.")
-
-
-@allowed_chat_only
-async def make_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    # Drop "/image" and any alias prefix, so the description alone reaches the
-    # drawing model; clean_prompt has already removed the bot mention and name.
-    body = re.sub(r"^\s*/\S+\s*", "", clean_prompt(message.text or "",
-                                                        context.bot.username or ""))
-    await draw_and_send(message, image_request(body) or body)
-
-
 @allowed_chat_only
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not directed_to_bot(update, context):
@@ -549,12 +439,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not text:
         return
     key = thread_key(update)
-    requested_image = image_request(text)
-    if requested_image:
-        # A picture is not part of the conversation memory or the dataset, so
-        # the turn is answered and forgotten like a command would be.
-        await draw_and_send(message, requested_image)
-        return
     try:
         history = memory.recent(*key) if key else []
         answer = await ai.answer_text(text, history=history)
@@ -828,8 +712,7 @@ async def post_init(application: Application) -> None:
 def main() -> None:
     global settings, ai, health_port
     settings = Settings.from_env()
-    ai = GeminiClient(settings.gemini_api_key, settings.gemini_model,
-                      settings.gemini_image_model)
+    ai = GeminiClient(settings.gemini_api_key, settings.gemini_model)
     health_port = start_health_server()
     application = (Application.builder()
                    .token(settings.telegram_bot_token)
@@ -850,17 +733,10 @@ def main() -> None:
     application.add_handler(CommandHandler("backup", backup))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("forget", forget))
-    # CommandHandler takes one command name at a time, and it refuses anything
-    # that is not a plain Latin name, so the Arabic spellings are matched as
-    # text and handed to the same function.
-    for command in ("image", "draw"):
-        application.add_handler(CommandHandler(command, make_image))
-    application.add_handler(MessageHandler(filters.Regex(ARABIC_IMAGE_COMMAND), make_image))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    logger.info("Leo starting with model %s, drawing with %s",
-                settings.gemini_model, settings.gemini_image_model)
+    logger.info("Leo starting with model %s", settings.gemini_model)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
