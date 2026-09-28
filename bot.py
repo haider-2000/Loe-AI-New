@@ -38,6 +38,27 @@ BUSY_MESSAGE = "الخدمة مشغولة حالياً لأن ضغط الطلب�
 # to come back in a minute would be a lie here: a limit of 0 does not refill.
 QUOTA_MESSAGE = "الخدمة مو متوفرة على الحساب حالياً، فما أگدر أنفّذ الطلب. جرّب بعدين."
 
+# How long Telegram keeps a "typing" indicator alive before the client hides it.
+# The wait is refreshed on this boundary so the student never sees it vanish
+# while the bot is still working on their question.
+TYPING_ACTION_TTL = 4.0
+
+# Files the bot knows how to read, mapped to the extension used if it ever has
+# to name one. A GIF is not in here on purpose: Telegram hands a GIF to a bot as
+# a document with a video/mp4 mime type, so mp4 is the format that actually
+# arrives and there is no image/gif to wait for.
+DOCUMENT_MIMES = {
+    "application/pdf": ".pdf",
+    "video/mp4": ".mp4",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+VIDEO_MIMES = frozenset({"video/mp4"})
+UNSUPPORTED_DOCUMENT_MESSAGE = (
+    "ما أگدر أقرأ هذا النوع من الملفات. أرسل PDF أو صورة (JPG/PNG) "
+    "أو GIF أو مقطع MP4.")
+
 # A local file already survives on the laptop, so the image bytes only need a
 # second home when the database lives somewhere ephemeral, like a Render container.
 stored_remotely = True
@@ -135,6 +156,36 @@ def _chunks(text: str, limit: int = 4096) -> list[str]:
     if current:
         parts.append(current)
     return [p for p in parts if p]
+
+
+async def show_thinking(message) -> None:
+    """Light up Telegram's typing indicator, ignoring chats that refuse it.
+
+    A missing indicator must never cost the student their answer, so a failure
+    here is swallowed rather than raised into the handler.
+    """
+    chat = getattr(message, "chat", None)
+    if chat is None:
+        return
+    try:
+        await chat.send_action("typing")
+    except Exception:
+        logger.debug("Could not show the typing indicator", exc_info=True)
+
+
+async def thinking_pause(message) -> None:
+    """Wait before answering so the bot reads as thinking, not as a lookup.
+
+    The indicator is refreshed while waiting because Telegram clears it after a
+    few seconds; without that the student would watch it blink out and assume
+    the bot had died. A delay of 0 answers immediately.
+    """
+    remaining = settings.answer_delay_seconds
+    while remaining > 0:
+        await show_thinking(message)
+        step = min(TYPING_ACTION_TTL, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
 
 
 async def reply_answer(message, text: str) -> None:
@@ -314,6 +365,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "كل اختبار ٥ أسئلة اختيار من متعدد، تجاوب بالأزرار (أ ب ج د) وتعرف النتيجة مع شرح ليش جوابك صح أو غلط.\n"
         "النتائج تنحفظ لكل طالب لحاله وتگدر تشوفها بـ /progress.\n\n"
         "و anyone يگدر يسكّت البوت بهالمحادثة بـ/pause، ويرجع يرد أول ما أحد من هنا يرسل /start.\n\n"
+        "أگدر تقرا برضو ملفات PDF و GIF والمقاطع القصيرة، دزها مثل أي سؤال.\n\n"
         "أتذكر آخر ٥ أسئلة وجواباتها منك فقط (لكل مجموعة على حدة) عشان تكمل بنفس الموضوع. "
         "هذه الذاكرة مؤقتة بالجهاز وما تنحفظ بالداتابيز، وبتقدر تمسحها بـ /forget.\n\n"
         "تنظيم الحصص (للمدير):\n/newlesson العنوان | التاريخ | الوقت | السعة\n"
@@ -519,6 +571,66 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @allowed_chat_only
 @active_only
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Answer from a file: PDF, photo, GIF or short MP4.
+
+    The bytes are held in memory and never written to disk: a document is read
+    once and answered, it is not a dataset item, so there is no file for a later
+    restart to lose. Only the question and the answer are kept, as text.
+    """
+    if not directed_to_bot(update, context):
+        return
+    message = update.effective_message
+    document = message.document
+    mime = (document.mime_type or "").lower()
+    if mime not in DOCUMENT_MIMES:
+        # Said plainly rather than staying silent, so a student who sent the
+        # wrong file learns why nothing came back.
+        await message.reply_text(UNSUPPORTED_DOCUMENT_MESSAGE)
+        return
+    is_video = mime in VIDEO_MIMES
+    limit = settings.max_video_bytes if is_video else settings.max_document_bytes
+    if document.file_size and document.file_size > limit:
+        megabytes = limit // (1024 * 1024)
+        if is_video:
+            await message.reply_text(
+                f"المقطع أكبر من الحد المسموح ({megabytes} MB). "
+                "المقاطع الكبيرة تاكل حصة الخدمة، فاقصّر الفيديو قبل ما ترسله.")
+        else:
+            await message.reply_text(
+                f"الملف أكبر من الحد المسموح ({megabytes} MB). "
+                "صغّره أو أرسل صفحاته كصور بدال الملف كله.")
+        return
+    caption = message.caption or ""
+    question = clean_prompt(caption, context.bot.username or "") or "اشرحلي الملف هذا."
+    key = thread_key(update)
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        data = bytes(await telegram_file.download_as_bytearray())
+        # The wait goes after the download, so a slow or failed transfer does
+        # not spend the student's seven seconds before anything is even read.
+        await thinking_pause(message)
+        history = memory.recent(*key) if key else []
+        answer = await ai.answer_file(data, mime, caption, history=history)
+        if key:
+            memory.remember(*key, question, answer)
+        # Stored as text: the PII scan on the text is what keeps a document
+        # full of names and phone numbers out of any export.
+        await save_text(settings.database_path, question, answer, "data/raw/documents")
+        await reply_answer(message, answer)
+    except GeminiQuotaError:
+        logger.error("No quota for any model while reading a %s", mime)
+        await message.reply_text(QUOTA_MESSAGE)
+    except GeminiUnavailableError:
+        logger.warning("All Gemini models are busy while reading a %s", mime)
+        await message.reply_text(BUSY_MESSAGE)
+    except Exception:
+        logger.exception("Document processing failed")
+        await message.reply_text("ما كدرت أقرأ الملف هذا. تأكد إنه PDF أو صورة واضحة.")
+
+
+@allowed_chat_only
+@active_only
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not directed_to_bot(update, context):
         return
@@ -529,6 +641,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     key = thread_key(update)
     try:
         history = memory.recent(*key) if key else []
+        await thinking_pause(message)
         answer = await ai.answer_text(text, history=history)
         if key:
             memory.remember(*key, text, answer)
@@ -567,6 +680,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # remembered as a picture rather than skipped.
         asked = clean_prompt(message.caption or "", context.bot.username or "") or "[صورة]"
         history = memory.recent(*key) if key else []
+        await thinking_pause(message)
         answer = await ai.answer_image(data, "image/jpeg", message.caption or "",
                                        history=history)
         if key:
@@ -621,6 +735,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         telegram_file = await context.bot.get_file(voice.file_id)
         audio_bytes = await telegram_file.download_as_bytearray()
         history = memory.recent(*key) if key else []
+        await thinking_pause(message)
         transcription, answer = await ai.answer_voice(bytes(audio_bytes),
                                                       voice.mime_type or "audio/ogg",
                                                       history=history)
@@ -1047,6 +1162,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(quiz_answered, pattern=r"^qa:"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("Leo starting with model %s", settings.gemini_model)
     application.run_polling(allowed_updates=Update.ALL_TYPES)

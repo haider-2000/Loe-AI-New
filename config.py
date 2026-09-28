@@ -8,6 +8,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _positive_int(name: str, fallback: int) -> int:
+    """A byte limit from the environment, ignoring junk rather than crashing."""
+    raw = os.getenv(name, "").strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        return fallback
+    return int(raw)
+
+
+def _non_negative_float(name: str, fallback: float) -> float:
+    """A seconds value from the environment; 0 is a valid "answer now"."""
+    raw = os.getenv(name, "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return fallback
+    return value if value >= 0 else fallback
+
+
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
@@ -17,6 +35,15 @@ class Settings:
     database_path: str = "data/edu_bot.db"
     max_download_bytes: int = 20 * 1024 * 1024
     max_message_chars: int = 12000
+    # A document or a photo sent as a file. Kept apart from the photo limit
+    # because a PDF carries far more meaning per megabyte than a JPEG.
+    max_document_bytes: int = 20 * 1024 * 1024
+    # Video is capped lower on purpose: a short MP4 already eats a large slice
+    # of the daily quota, and a long one can take a whole request by itself.
+    max_video_bytes: int = 10 * 1024 * 1024
+    # The bot waits before it answers, so it reads as thinking rather than as a
+    # lookup. Set to 0 to answer immediately.
+    answer_delay_seconds: float = 7.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -38,4 +65,7 @@ class Settings:
             # container disk there is wiped on every restart. A libsql:// value
             # lands in the same field as a plain local path.
             database_path=(os.getenv("DB_URL") or os.getenv("DATABASE_PATH") or "data/edu_bot.db").strip(),
+            max_document_bytes=_positive_int("MAX_DOCUMENT_BYTES", 20 * 1024 * 1024),
+            max_video_bytes=_positive_int("MAX_VIDEO_BYTES", 10 * 1024 * 1024),
+            answer_delay_seconds=_non_negative_float("ANSWER_DELAY_SECONDS", 7.0),
         )

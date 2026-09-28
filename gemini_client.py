@@ -278,12 +278,22 @@ class GeminiClient:
     async def answer_text(self, text: str, history: Sequence[Turn] = ()) -> str:
         return await self._generate([text], history=history)
 
-    async def answer_image(self, image_bytes: bytes, mime_type: str, caption: str = "",
-                           history: Sequence[Turn] = ()) -> str:
-        parts: list[types.Part | str] = [types.Part.from_bytes(data=image_bytes, mime_type=mime_type)]
+    async def answer_file(self, data: bytes, mime_type: str, caption: str = "",
+                          history: Sequence[Turn] = ()) -> str:
+        """Answer from any inline file Gemini accepts.
+
+        One code path for images, PDFs, GIFs and video: the API reads the mime
+        type off the part, so a scanned PDF and an MP4 are handled the same way a
+        JPEG is, and the caller does not need a branch per format.
+        """
+        parts: list[types.Part | str] = [types.Part.from_bytes(data=data, mime_type=mime_type)]
         if caption:
             parts.append(caption)
         return await self._generate(parts, history=history)
+
+    async def answer_image(self, image_bytes: bytes, mime_type: str, caption: str = "",
+                           history: Sequence[Turn] = ()) -> str:
+        return await self.answer_file(image_bytes, mime_type, caption, history)
 
     async def image_has_obvious_pii(self, image_bytes: bytes, mime_type: str) -> bool:
         text = await self._complete(
