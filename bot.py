@@ -27,6 +27,7 @@ from database import (count_by_status, create_lesson, enroll_student, image_name
                       set_privacy_flag, snapshot_database, store_image)
 from dataset import export_dataset, save_image, save_text, save_voice_transcription
 from gemini_client import GeminiClient, GeminiUnavailableError
+from memory import ConversationMemory
 
 BUSY_MESSAGE = "الخدمة مشغولة حالياً لأن ضغط الطلبات عالية. حاول بعد دقيقة."
 
@@ -50,6 +51,9 @@ logger = logging.getLogger(__name__)
 
 settings: Settings
 ai: GeminiClient
+# What the bot remembers between messages, so "and the second one?" keeps
+# pointing at the same topic instead of starting from nothing.
+memory = ConversationMemory()
 
 
 def is_admin(update: Update) -> bool:
@@ -199,19 +203,34 @@ def clean_prompt(text: str, bot_username: str = "") -> str:
     return text[: settings.max_message_chars]
 
 
+def thread_key(update: Update) -> tuple[int, int] | None:
+    """Identify whose memory this update belongs to, or None if it is unknown.
+
+    A channel post has no author we can attribute, and a channel is not a
+    conversation with one student, so it gets no memory at all.
+    """
+    chat, user = update.effective_chat, update.effective_user
+    if not chat or not user:
+        return None
+    return chat.id, user.id
+
+
 @allowed_chat_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "هلا بيك! آني Leo، كيف أساعدك اليوم؟ "
-        "دز سؤالك بالنص، صورة، أو رسالة صوتية، ووجّهها إليّ بالمجموعة بكتابة اسمي (leo أو ليو) أو بالرد على رسالتي."
+        "دز سؤالك بالنص، صورة، أو رسالة صوتية، ووجّهها إليّ بالمجموعة بكتابة اسمي (leo أو ليو) أو بالرد على رسالتي. "
+        "أتذكر آخر ٥ أسئلة منك، فتكدر تسأل «والثاني؟» وتكمل بنفس الموضوع."
     )
 
 
 @allowed_chat_only
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "الأوامر المتاحة:\n/start - بدء الاستخدام\n/help - المساعدة\n/privacy - الخصوصية\n/status - حالة الخدمة\n/cancel - إلغاء العملية الحالية\n"
+        "الأوامر المتاحة:\n/start - بدء الاستخدام\n/help - المساعدة\n/privacy - الخصوصية\n/status - حالة الخدمة\n/forget - نسيان آخر المواضيع\n/cancel - إلغاء العملية الحالية\n"
         "بالمجموعة ما أرد على كل الرسائل؛ اكتب اسمي (leo أو ليو) بالسؤال، أو رد على رسالتي.\n\n"
+        "أتذكر آخر ٥ أسئلة وجواباتها منك فقط (لكل مجموعة على حدة) عشان تكمل بنفس الموضوع. "
+        "هذه الذاكرة مؤقتة بالجهاز وما تنحفظ بالداتابيز، وبتقدر تمسحها بـ /forget.\n\n"
         "تنظيم الحصص (للمدير):\n/newlesson العنوان | التاريخ | الوقت | السعة\n"
         "/addstudent رقم_الحصة | رمز_الطالب\n/roster رقم_الحصة\n"
         "ولكل الطلاب: /lessons لعرض الحصص والمقاعد المتبقية."
@@ -223,8 +242,20 @@ async def privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "الخصوصية: ما نخزّن Telegram IDs أو أسماء المستخدمين أو usernames ضمن dataset. "
         "الصوت يُستخدم للفهم فقط ولا يُحفظ نهائيًا؛ قد تُحفظ الترجمة كنص تعليمي. "
-        "الصور التعليمية والنصوص المفيدة تدخل مراجعة داخلية، وأي محتوى عليه مؤشرات شخصية واضحة يُعلّم privacy_flag ويُستبعد من التصدير."
+        "الصور التعليمية والنصوص المفيدة تدخل مراجعة داخلية، وأي محتوى عليه مؤشرات شخصية واضحة يُعلّم privacy_flag ويُستبعد من التصدير. "
+        "ذاكرة المحادثة (آخر ٥ أسئلة وجواباتها) تبقى بجهاز الخادم فقط، لكل طالب على حدة، "
+        "وما تنكتب بالداتابيز ولا بالنسخة الاحتياطية، وتروح لما يعيد الخادم يشتغل — وبتقدر تمسحها فوراً بـ /forget."
     )
+
+
+@allowed_chat_only
+async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    key = thread_key(update)
+    dropped = memory.forget(*key) if key else 0
+    if dropped:
+        await update.effective_message.reply_text(f"انسيت آخر {dropped} سؤال. بكرة نبدأ من جديد.")
+    else:
+        await update.effective_message.reply_text("ماكو شي محفوظ أنساه.")
 
 
 @allowed_chat_only
@@ -403,8 +434,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = clean_prompt(message.text or "", context.bot.username or "")
     if not text:
         return
+    key = thread_key(update)
     try:
-        answer = await ai.answer_text(text)
+        history = memory.recent(*key) if key else []
+        answer = await ai.answer_text(text, history=history)
+        if key:
+            memory.remember(*key, text, answer)
         await save_text(settings.database_path, text, answer, "data/raw/text")
         await reply_answer(message, answer)
     except GeminiUnavailableError:
@@ -427,11 +462,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     image_dir = Path("data/raw/images")
     image_dir.mkdir(parents=True, exist_ok=True)
     local_path = image_dir / f"{uuid.uuid4().hex}.jpg"
+    key = thread_key(update)
     try:
         telegram_file = await context.bot.get_file(photo.file_id)
         await telegram_file.download_to_drive(custom_path=str(local_path))
         data = local_path.read_bytes()
-        answer = await ai.answer_image(data, "image/jpeg", message.caption or "")
+        # A photo with no caption still continues the topic, so the turn is
+        # remembered as a picture rather than skipped.
+        asked = clean_prompt(message.caption or "", context.bot.username or "") or "[صورة]"
+        history = memory.recent(*key) if key else []
+        answer = await ai.answer_image(data, "image/jpeg", message.caption or "",
+                                       history=history)
+        if key:
+            memory.remember(*key, asked, answer)
         visual_pii = await ai.image_has_obvious_pii(data, "image/jpeg")
         saved = await save_image(settings.database_path, str(local_path), message.caption or "",
                                  answer, dedupe_key=hashlib.sha256(data).hexdigest())
@@ -471,10 +514,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text("الرسالة الصوتية أكبر من الحد المسموح.")
         return
     audio_bytes = b""
+    key = thread_key(update)
     try:
         telegram_file = await context.bot.get_file(voice.file_id)
         audio_bytes = await telegram_file.download_as_bytearray()
-        transcription, answer = await ai.answer_voice(bytes(audio_bytes), voice.mime_type or "audio/ogg")
+        history = memory.recent(*key) if key else []
+        transcription, answer = await ai.answer_voice(bytes(audio_bytes),
+                                                      voice.mime_type or "audio/ogg",
+                                                      history=history)
+        if key:
+            memory.remember(*key, transcription or "[رسالة صوتية]", answer)
         await save_voice_transcription(settings.database_path, transcription, answer)
         await reply_answer(message, answer)
     except GeminiUnavailableError:
@@ -668,6 +717,7 @@ def main() -> None:
     application.add_handler(CommandHandler("export", export))
     application.add_handler(CommandHandler("backup", backup))
     application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("forget", forget))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

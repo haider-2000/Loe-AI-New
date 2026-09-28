@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Sequence
 
 from google import genai
 from google.genai import types
+
+from memory import Turn
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,15 @@ Rules:
 - For images, read handwritten or printed educational content and answer it. For voice, transcribe and answer, but never mention storing audio.
 - Plain text only: no markdown, no asterisks, no bold, no headings, no bullet symbols.
 - No personal-data commentary."""
+
+# Appended only when earlier turns are replayed, so the model treats them as
+# background for a question that is still open rather than as work to redo.
+CONTINUATION_RULE = (
+    "\n\nConversation: the earlier turns are the same student's recent exchanges, "
+    "replayed for context only. Use them to follow the topic, do not answer them "
+    "again, do not repeat a previous answer, and do not greet again unless the "
+    "student greets you now."
+)
 
 # Tried in order when the primary model is temporarily unavailable, so a 503 on
 # one model does not take the whole bot offline. The two lite models lead the
@@ -80,11 +92,24 @@ class GeminiClient:
     async def _complete(self, parts: list[types.Part | str],
                         system_prompt: str | None = SYSTEM_PROMPT,
                         empty_message: str = "Gemini returned an empty response",
-                        allow_empty: bool = False) -> str:
+                        allow_empty: bool = False,
+                        history: Sequence[Turn] = ()) -> str:
+        """Send one request, optionally preceded by the earlier turns.
+
+        The history is replayed as real alternating turns rather than pasted
+        into the prompt, so the model reads it as a conversation it is already
+        in. Anything earlier than memory's own cap is simply not here.
+        """
         content_parts = [p if isinstance(p, types.Part) else types.Part(text=p) for p in parts]
         if system_prompt is not None:
+            if history:
+                system_prompt += CONTINUATION_RULE
             content_parts.insert(0, types.Part(text=system_prompt))
-        contents = [types.Content(role="user", parts=content_parts)]
+        contents: list[types.Content] = []
+        for question, answer in history:
+            contents.append(types.Content(role="user", parts=[types.Part(text=question)]))
+            contents.append(types.Content(role="model", parts=[types.Part(text=answer)]))
+        contents.append(types.Content(role="user", parts=content_parts))
 
         last: Exception | None = None
         gate = _call_gate()
@@ -113,17 +138,19 @@ class GeminiClient:
         raise GeminiUnavailableError(
             f"All Gemini models unavailable; last error: {_brief(last)}") from last
 
-    async def _generate(self, parts: list[types.Part | str]) -> str:
-        return await self._complete(parts)
+    async def _generate(self, parts: list[types.Part | str],
+                        history: Sequence[Turn] = ()) -> str:
+        return await self._complete(parts, history=history)
 
-    async def answer_text(self, text: str) -> str:
-        return await self._generate([text])
+    async def answer_text(self, text: str, history: Sequence[Turn] = ()) -> str:
+        return await self._generate([text], history=history)
 
-    async def answer_image(self, image_bytes: bytes, mime_type: str, caption: str = "") -> str:
+    async def answer_image(self, image_bytes: bytes, mime_type: str, caption: str = "",
+                           history: Sequence[Turn] = ()) -> str:
         parts: list[types.Part | str] = [types.Part.from_bytes(data=image_bytes, mime_type=mime_type)]
         if caption:
             parts.append(caption)
-        return await self._generate(parts)
+        return await self._generate(parts, history=history)
 
     async def image_has_obvious_pii(self, image_bytes: bytes, mime_type: str) -> bool:
         text = await self._complete(
@@ -132,12 +159,14 @@ class GeminiClient:
             system_prompt=None, allow_empty=True)
         return text.strip().upper().startswith("YES")
 
-    async def answer_voice(self, audio_bytes: bytes, mime_type: str) -> tuple[str, str]:
+    async def answer_voice(self, audio_bytes: bytes, mime_type: str,
+                           history: Sequence[Turn] = ()) -> tuple[str, str]:
         transcription_prompt = "Transcribe this voice message exactly, then answer the educational question. Format: TRANSCRIPTION:\\n...\\nANSWER:\\n..."
         text = await self._complete(
             [types.Part(text=transcription_prompt),
              types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)],
-            empty_message="Gemini returned an empty voice response")
+            empty_message="Gemini returned an empty voice response",
+            history=history)
         split = re.search(r"\bANSWER\s*:", text, re.IGNORECASE)
         if split:
             transcription = _strip_label(text[: split.start()], "TRANSCRIPTION")
