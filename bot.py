@@ -540,11 +540,24 @@ def start_health_server() -> int | None:
 
 
 async def keep_awake(port: int, interval: int = 240) -> None:
-    """Ping our own health endpoint so the instance is never treated as idle."""
+    """Ping our own health endpoint so the instance is never treated as idle.
+
+    The target has to be the public URL, not 127.0.0.1. Render spins a Free web
+    service down after 15 minutes without *inbound* traffic, and a request that
+    starts inside the container never reaches the edge that does the counting,
+    so a loopback ping keeps the process alive and the service dead. Polling
+    Telegram does not help either: that is outbound. RENDER_EXTERNAL_URL is set
+    by Render for web services and is the only self-addressable way to produce
+    the inbound request we need. UptimeRobot pointed at the same URL is a useful
+    second pair of eyes, since a crash cannot stop an outside pinger.
+    """
+    public = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    target = f"{public}/health" if public else f"http://127.0.0.1:{port}/health"
+    logger.info("Keep-alive will ping %s every %d second(s)", target, interval)
     while True:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                await client.get(f"http://127.0.0.1:{port}/health")
+                await client.get(target)
         except Exception:
             logger.debug("self ping failed", exc_info=True)
         await asyncio.sleep(interval)
