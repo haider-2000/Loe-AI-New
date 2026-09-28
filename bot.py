@@ -26,7 +26,8 @@ from config import Settings
 from database import (count_by_status, create_lesson, create_quiz_session, enroll_student,
                       get_quiz_session, image_names, init_db, is_remote, lesson_roster,
                       list_lessons, load_image, pending_rows, quiz_history, quiz_overall,
-                      record_quiz_answer, set_privacy_flag, snapshot_database, store_image)
+                      read_flag, record_quiz_answer, set_privacy_flag, snapshot_database,
+                      store_image, write_flag)
 from dataset import export_dataset, save_image, save_text, save_voice_transcription
 from gemini_client import GeminiClient, GeminiQuotaError, GeminiUnavailableError
 from memory import ConversationMemory
@@ -221,8 +222,67 @@ def thread_key(update: Update) -> tuple[int, int] | None:
     return chat.id, user.id
 
 
+PAUSED_FLAG = "paused"
+# The pause flag is read on every student update, so it is cached in the
+# process after the first lookup. The flag itself is written to the database,
+# which is what makes a pause survive a restart; this cache only saves the
+# round trip, and the single Render instance owns the truth.
+_paused: bool | None = None
+
+
+async def is_paused() -> bool:
+    global _paused
+    if _paused is None:
+        _paused = (await read_flag(settings.database_path, PAUSED_FLAG)) == "1"
+    return _paused
+
+
+async def set_paused(paused: bool) -> None:
+    global _paused
+    _paused = paused
+    await write_flag(settings.database_path, PAUSED_FLAG, "1" if paused else "0")
+
+
+def active_only(handler):
+    """Stay completely silent while the bot is paused.
+
+    A student must not be able to tell a paused bot from an offline one, so
+    nothing is sent at all: no reply, no hint, no Gemini call. /start is the one
+    way back, which is why it is deliberately not wrapped in this.
+    """
+    @wraps(handler)
+    async def guarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if await is_paused():
+            return
+        return await handler(update, context)
+
+    return guarded
+
+
+@allowed_chat_only
+async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop answering students until somebody runs /start."""
+    if not is_admin(update):
+        return
+    message = update.effective_message
+    if await is_paused():
+        await message.reply_text("البوت مسكوت أصلاً. أرسل /start يرجّعه.")
+        return
+    await set_paused(True)
+    logger.warning("Bot paused by the admin; students get silence until /start")
+    await message.reply_text("سكّيت البوت. ما راح يرد على أحد لحد ما أحد يرسل /start.")
+
+
 @allowed_chat_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await is_paused():
+        # Anyone can bring the bot back, which is what makes the pause a
+        # temporary switch rather than a setting only the owner controls.
+        await set_paused(False)
+        logger.warning("Bot resumed by /start from %s", update.effective_user.id)
+        await update.effective_message.reply_text(
+            "رجّعت البوت، وياك راح يرد على الكل من هالحين. اسأل براحتك!")
+        return
     await update.effective_message.reply_text(
         "هلا بيك! آني Leo، كيف أساعدك اليوم؟ "
         "دز سؤالك بالنص، صورة، أو رسالة صوتية، ووجّهها إليّ بالمجموعة بكتابة اسمي (leo أو ليو) أو بالرد على رسالتي. "
@@ -238,6 +298,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "وتكتب /quiz تطلع لك قائمة باختصاصات الذكاء الاصطناعي تختار منها، أو تكتب /quiz الموضوع مباشرة مثل /quiz تعلم الآلة.\n"
         "كل اختبار ٥ أسئلة اختيار من متعدد، تجاوب بالأزرار (أ ب ج د) وتعرف النتيجة مع شرح ليش جوابك صح أو غلط.\n"
         "النتائج تنحفظ لكل طالب لحاله وتگدر تشوفها بـ /progress.\n\n"
+        "وللمدير: /pause يسكت البوت لحد ما أحد يرسل /start، فيرجع يرد على الكل.\n\n"
         "أتذكر آخر ٥ أسئلة وجواباتها منك فقط (لكل مجموعة على حدة) عشان تكمل بنفس الموضوع. "
         "هذه الذاكرة مؤقتة بالجهاز وما تنحفظ بالداتابيز، وبتقدر تمسحها بـ /forget.\n\n"
         "تنظيم الحصص (للمدير):\n/newlesson العنوان | التاريخ | الوقت | السعة\n"
@@ -269,6 +330,12 @@ async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @allowed_chat_only
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await is_paused():
+        # Saying "the service is running" here would be the same lie as
+        # promising a retry on a dead quota, so the pause is reported instead.
+        await update.effective_message.reply_text(
+            "البوت مسكوت حالياً. يرجع يرد أول ما أحد يرسل /start.")
+        return
     counts = await count_by_status(settings.database_path)
     summary = ", ".join(f"{key}: {value}" for key, value in sorted(counts.items())) or "لا توجد إدخالات بعد"
     await update.effective_message.reply_text(f"الخدمة تعمل. حالات البيانات: {summary}")
@@ -436,6 +503,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @allowed_chat_only
+@active_only
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not directed_to_bot(update, context):
         return
@@ -463,6 +531,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 @allowed_chat_only
+@active_only
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not directed_to_bot(update, context):
         return
@@ -522,6 +591,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @allowed_chat_only
+@active_only
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not directed_to_bot(update, context):
         return
@@ -777,6 +847,7 @@ async def start_quiz(message, topic: str, user) -> None:
 
 
 @allowed_chat_only
+@active_only
 async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Start an exam, either on a topic the student types or from the menu."""
     message = update.effective_message
@@ -793,6 +864,7 @@ async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start_quiz(message, topic, message.from_user)
 
 
+@active_only
 async def quiz_topic_picked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -811,6 +883,7 @@ async def quiz_topic_picked(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await start_quiz(message, topic, query.from_user)
 
 
+@active_only
 async def quiz_answered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Grade one answer, explain it, and move to the next question."""
     query = update.callback_query
@@ -886,6 +959,7 @@ async def finish_quiz(message, topic: str, score: int, total: int) -> None:
 
 
 @allowed_chat_only
+@active_only
 async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show this student's own exam history and totals."""
     message = update.effective_message
@@ -951,6 +1025,7 @@ def main() -> None:
     application.add_handler(CommandHandler("backup", backup))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("forget", forget))
+    application.add_handler(CommandHandler("pause", pause))
     application.add_handler(CommandHandler("quiz", quiz))
     application.add_handler(CommandHandler("progress", progress))
     application.add_handler(CallbackQueryHandler(quiz_topic_picked, pattern=r"^qtopic:"))

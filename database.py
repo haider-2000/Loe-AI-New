@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS images (
     content BLOB NOT NULL,
     stored_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS bot_flags (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS quiz_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
@@ -71,7 +75,8 @@ CREATE INDEX IF NOT EXISTS idx_quiz_sessions_student
 """
 
 REMOTE_PREFIXES = ("libsql://", "https://", "wss://")
-_TABLES = ("contributions", "lessons", "lesson_students", "images", "quiz_sessions")
+_TABLES = ("contributions", "lessons", "lesson_students", "images", "bot_flags",
+           "quiz_sessions")
 
 
 def database_url() -> str:
@@ -592,3 +597,17 @@ async def quiz_overall(url: str, chat_id: int, user_id: int) -> dict[str, int]:
             "questions": int(row.get("questions") or 0),
             "correct": int(row.get("correct") or 0),
             "answered": int(row.get("answered") or 0)}
+
+
+async def read_flag(url: str, name: str) -> str | None:
+    """A small durable switch, so a restart does not quietly undo a decision."""
+    async with _connect(url) as db:
+        rows = await _fetch_all(db, "SELECT value FROM bot_flags WHERE name = ?", (name,))
+    return rows[0]["value"] if rows else None
+
+
+async def write_flag(url: str, name: str, value: str) -> None:
+    async with _connect(url) as db:
+        await db.execute("INSERT OR REPLACE INTO bot_flags (name, value) VALUES (?, ?)",
+                         (name, value))
+        await db.commit()
