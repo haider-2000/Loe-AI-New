@@ -289,6 +289,42 @@ async def approved_rows(url: str) -> list[dict[str, Any]]:
                WHERE status = 'approved' AND privacy_flag = 0 ORDER BY id""")
 
 
+async def all_rows(url: str, limit: int = 100000) -> list[dict[str, Any]]:
+    """Every contribution, whatever its status or privacy flag."""
+    async with _connect(url) as db:
+        return await _fetch_all(
+            db,
+            """SELECT id, type, file_path, text_content, transcription, model_answer,
+                      language, dialect, privacy_flag, status, created_at
+               FROM contributions ORDER BY id LIMIT ?""", (limit,))
+
+
+async def set_contribution_status(url: str, contribution_id: int, status: str) -> int:
+    """Move one contribution between review, approved and rejected.
+
+    A private flag is deliberately untouched: approving an item is a judgement
+    about its teaching value, not a decision to publish whatever personal data
+    it happens to contain.
+    """
+    if status not in {"review", "approved", "rejected"}:
+        raise ValueError("status must be review, approved or rejected")
+    async with _connect(url) as db:
+        cursor = await db.execute(
+            "UPDATE contributions SET status = ? WHERE id = ?", (status, contribution_id)
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
+async def latest_pending_id(url: str) -> int | None:
+    """The newest contribution still waiting for a decision, if there is one."""
+    async with _connect(url) as db:
+        rows = await _fetch_all(
+            db, "SELECT id FROM contributions WHERE status = 'review' ORDER BY id DESC LIMIT 1"
+        )
+    return int(rows[0]["id"]) if rows else None
+
+
 async def set_privacy_flag(url: str, file_path: str) -> int:
     """Flag a stored contribution by file path (used after a visual PII check)."""
     async with _connect(url) as db:
@@ -418,8 +454,18 @@ async def migrate_database(source_url: str, dest_url: str) -> dict[str, int]:
     return moved
 
 
-async def export_jsonl(url: str, output_path: str) -> tuple[str, int]:
-    rows = await approved_rows(url)
+async def export_jsonl(url: str, output_path: str,
+                      everything: bool = False) -> tuple[str, int]:
+    """Write the dataset as JSONL.
+
+    By default only approved and unflagged rows go out, so a careless export
+    cannot publish a phone number a student wrote. `everything` is the owner's
+    escape hatch for their own review, and it says so in the file itself.
+    """
+    if everything:
+        rows = await all_rows(url)
+    else:
+        rows = await approved_rows(url)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as handle:
         for row in rows:
@@ -430,6 +476,11 @@ async def export_jsonl(url: str, output_path: str) -> tuple[str, int]:
                 "language": row["language"] or "ar",
                 "dialect": row["dialect"] or "iraqi",
             }
+            if everything:
+                # Kept so an unfiltered export is never mistaken for a clean
+                # one, and so the owner can see which rows are still unreviewed.
+                item["status"] = row.get("status") or ""
+                item["privacy_flagged"] = bool(row.get("privacy_flag"))
             if row["type"] == "image":
                 item["image"] = row["file_path"] or ""
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")

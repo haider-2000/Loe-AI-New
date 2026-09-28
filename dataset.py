@@ -59,5 +59,6 @@ async def save_voice_transcription(db_path: str, transcription: str, answer: str
     )
 
 
-async def export_dataset(db_path: str, output_path: str) -> tuple[str, int]:
-    return await export_jsonl(db_path, output_path)
+async def export_dataset(db_path: str, output_path: str,
+                         everything: bool = False) -> tuple[str, int]:
+    return await export_jsonl(db_path, output_path, everything=everything)

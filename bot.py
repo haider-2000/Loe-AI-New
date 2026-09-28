@@ -23,11 +23,12 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
                           MessageHandler, filters)
 
 from config import Settings
-from database import (count_by_status, create_lesson, create_quiz_session, enroll_student,
-                      get_quiz_session, image_names, init_db, is_remote, lesson_roster,
-                      list_lessons, load_image, pending_rows, quiz_history, quiz_overall,
-                      read_flag, record_quiz_answer, set_privacy_flag, snapshot_database,
-                      store_image, write_flag)
+from database import (all_rows, count_by_status, create_lesson, create_quiz_session,
+                      enroll_student, get_quiz_session, image_names, init_db, is_remote,
+                      latest_pending_id, lesson_roster, list_lessons, load_image, pending_rows,
+                      quiz_history, quiz_overall, read_flag, record_quiz_answer,
+                      set_contribution_status, set_privacy_flag, snapshot_database, store_image,
+                      write_flag)
 from dataset import export_dataset, save_image, save_text, save_voice_transcription
 from gemini_client import GeminiClient, GeminiQuotaError, GeminiUnavailableError
 from memory import ConversationMemory
@@ -59,9 +60,11 @@ UNSUPPORTED_DOCUMENT_MESSAGE = (
     "ما أگدر أقرأ هذا النوع من الملفات. أرسل PDF أو صورة (JPG/PNG) "
     "أو GIF أو مقطع MP4.")
 
-# A local file already survives on the laptop, so the image bytes only need a
-# second home when the database lives somewhere ephemeral, like a Render container.
-stored_remotely = True
+# Whether the *database* lives somewhere ephemeral, like a Render container.
+# The name matters: it says nothing about the image bytes. A local disk already
+# keeps the file, so the bytes only need a second home inside the database when
+# that disk is wiped on every restart.
+database_is_remote = True
 # Set by start_health_server when the platform gave us a port to listen on.
 health_port: int | None = None
 
@@ -370,7 +373,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "هذه الذاكرة مؤقتة بالجهاز وما تنحفظ بالداتابيز، وبتقدر تمسحها بـ /forget.\n\n"
         "تنظيم الحصص (للمدير):\n/newlesson العنوان | التاريخ | الوقت | السعة\n"
         "/addstudent رقم_الحصة | رمز_الطالب\n/roster رقم_الحصة\n"
-        "ولكل الطلاب: /lessons لعرض الحصص والمقاعد المتبقية."
+        "ولكل الطلاب: /lessons لعرض الحصص والمقاعد المتبقية.\n\n"
+        "للمدير: بعد ما تراجع المحتوى بـ /pending، اعتمده بـ /approve رقم_العنصر approved بالخاص، "
+        "وبعدين /export يطلع ملف التدريب."
     )
 
 
@@ -489,14 +494,80 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @allowed_chat_only
-async def export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@private_only
+async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Move a collected item to approved, or to rejected, by id.
+
+    Private chat only, so a decision about what leaves the dataset is never
+    taken in front of the class that sent it in.
+    """
     if not is_admin(update):
         return
+    message = update.effective_message
+    parts = (update.effective_message.text or "").split()
+    if len(parts) != 3 or parts[2] not in {"approved", "rejected", "review"}:
+        await message.reply_text(
+            "الصيغة: /approve رقم_العنصر approved | rejected | review\n"
+            "مثال: /approve 12 approved")
+        return
+    raw_id, wanted = parts[1], parts[2]
+    if not raw_id.isdigit():
+        await message.reply_text("رقم العنصر لازم يكون رقم.")
+        return
+    changed = await set_contribution_status(settings.database_path, int(raw_id), wanted)
+    if not changed:
+        await message.reply_text(f"ماكو عنصر بالمعرّف {raw_id}.")
+        return
+    counts = await count_by_status(settings.database_path)
+    if wanted == "approved":
+        flagged = await flagged_count()
+        blocked = (f" تنبيه: فيه {flagged} عنصر عليه علم خصوصية، "
+                   "وما يطلعون بالتصدير حتى لو يعتمدونه.") if flagged else ""
+        await message.reply_text(
+            f"اعتمدت العنصر #{raw_id}. الحالات: " + _status_summary(counts) + blocked)
+    elif wanted == "rejected":
+        await message.reply_text(
+            f"رفضت العنصر #{raw_id}. الحالات: " + _status_summary(counts))
+    else:
+        await message.reply_text(
+            f"رجّعت العنصر #{raw_id} للمراجعة. الحالات: " + _status_summary(counts))
+
+
+async def flagged_count() -> int:
+    rows = await all_rows(settings.database_path)
+    return sum(1 for row in rows if row.get("privacy_flag"))
+
+
+def _status_summary(counts: dict[str, int]) -> str:
+    return ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) or "فارغة"
+
+
+@allowed_chat_only
+async def export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the dataset as JSONL. `all` includes unreviewed and flagged rows."""
+    if not is_admin(update):
+        return
+    message = update.effective_message
+    everything = "all" in (update.effective_message.text or "").split()
+    if everything and message.chat.type != ChatType.PRIVATE:
+        # Unfiltered output can contain whatever a student typed, including
+        # personal details, so it is kept out of the group.
+        await message.reply_text("التصدير الكامل بالخاص فقط. أرسل /export all مباشرة مع البوت.")
+        return
     output = Path("data/exports") / f"dataset_{uuid.uuid4().hex[:10]}.jsonl"
-    path, count = await export_dataset(settings.database_path, str(output))
+    path, count = await export_dataset(settings.database_path, str(output),
+                                        everything=everything)
+    if not count:
+        # Sending an empty file would look like a successful export.
+        await message.reply_text(
+            "ماكو عناصر للتصدير. اعتمد العناصر أولاً بـ /approve، "
+            "أو استعمل /export all للكل.")
+        return
+    caption = (f"تصدير كامل: {count} عنصر (يشمل غير المعتمد والعلم عليهم).\n"
+               "احتفظ به لنفسك، ما تنشره." if everything
+               else f"تم تصدير {count} عنصر معتمد وآمن.")
     with open(path, "rb") as handle:
-        await update.effective_message.reply_document(
-            document=handle, caption=f"تم تصدير {count} عنصر معتمد وآمن.")
+        await message.reply_document(document=handle, caption=caption)
 
 
 async def build_backup_archive(stamp: str) -> tuple[Path, dict[str, Any]]:
@@ -608,7 +679,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         telegram_file = await context.bot.get_file(document.file_id)
         data = bytes(await telegram_file.download_as_bytearray())
         # The wait goes after the download, so a slow or failed transfer does
-        # not spend the student's seven seconds before anything is even read.
+        # not spend the student's reading time before anything is even read.
         await thinking_pause(message)
         history = memory.recent(*key) if key else []
         answer = await ai.answer_file(data, mime, caption, history=history)
@@ -694,9 +765,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         elif visual_pii:
             # Keep the image available for internal review, but prevent export.
             await set_privacy_flag(settings.database_path, str(local_path))
-        if saved and not stored_remotely:
-            # The disk is wiped on every restart, so the bytes have to live in the
-            # database too or the stored row ends up pointing at a missing file.
+        if saved and database_is_remote:
+            # The disk is wiped on every restart, so on a remote database the
+            # bytes have to live in the database too, or the stored row ends up
+            # pointing at a file that no longer exists. This is the case
+            # materialize_images puts back on the next boot.
             try:
                 await store_image(settings.database_path, local_path.name, data)
             except Exception:
@@ -1111,11 +1184,12 @@ async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def post_init(application: Application) -> None:
-    global stored_remotely
-    for directory in ("data/raw/images", "data/raw/text", "data/exports", "data/backups"):
+    global database_is_remote
+    for directory in ("data/raw/images", "data/raw/text", "data/raw/documents", "data/exports",
+                      "data/backups"):
         Path(directory).mkdir(parents=True, exist_ok=True)
-    stored_remotely = is_remote(settings.database_path)
-    restored = False if stored_remotely else restore_from_seed()
+    database_is_remote = is_remote(settings.database_path)
+    restored = False if database_is_remote else restore_from_seed()
     await init_db(settings.database_path)
     images_back = await materialize_images()
     logger.info(
@@ -1152,6 +1226,7 @@ def main() -> None:
     application.add_handler(CommandHandler("roster", roster))
     application.add_handler(CommandHandler("pending", pending))
     application.add_handler(CommandHandler("export", export))
+    application.add_handler(CommandHandler("approve", approve))
     application.add_handler(CommandHandler("backup", backup))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("forget", forget))

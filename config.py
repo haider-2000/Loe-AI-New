@@ -41,9 +41,10 @@ class Settings:
     # Video is capped lower on purpose: a short MP4 already eats a large slice
     # of the daily quota, and a long one can take a whole request by itself.
     max_video_bytes: int = 10 * 1024 * 1024
-    # The bot waits before it answers, so it reads as thinking rather than as a
-    # lookup. Set to 0 to answer immediately.
-    answer_delay_seconds: float = 7.0
+    # The bot waits before it answers. The default is no wait at all, because a
+    # student waiting on a maths answer would rather have it now than watch a
+    # typing indicator; raise it in the environment if you want a beat.
+    answer_delay_seconds: float = 0.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -67,5 +68,5 @@ class Settings:
             database_path=(os.getenv("DB_URL") or os.getenv("DATABASE_PATH") or "data/edu_bot.db").strip(),
             max_document_bytes=_positive_int("MAX_DOCUMENT_BYTES", 20 * 1024 * 1024),
             max_video_bytes=_positive_int("MAX_VIDEO_BYTES", 10 * 1024 * 1024),
-            answer_delay_seconds=_non_negative_float("ANSWER_DELAY_SECONDS", 7.0),
+            answer_delay_seconds=_non_negative_float("ANSWER_DELAY_SECONDS", 0.0),
         )
