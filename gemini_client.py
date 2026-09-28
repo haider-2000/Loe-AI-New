@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Sequence
+from typing import Any
 
 from google import genai
 from google.genai import types
@@ -45,6 +46,24 @@ CONTINUATION_RULE = (
 # a retry delay per model on every single reply.
 FALLBACK_MODELS = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite-preview",
                    "gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.6-flash")
+
+# Drawing is a separate family of models: the text models answer in words, these
+# come back with a picture in inline_data. The lite one leads the chain for the
+# same reason it leads the text chain, a busy group hits it first and it keeps
+# answering. None of these are reachable through generate_images, this key only
+# exposes them through generateContent.
+IMAGE_MODELS = ("gemini-3.1-flash-lite-image", "gemini-3.1-flash-image",
+                "gemini-2.5-flash-image", "gemini-3-pro-image")
+IMAGE_PROMPT = (
+    "Draw the picture the student describes and return the image itself.\n"
+    "Keep it suitable for a school lesson, with clear shapes and a plain "
+    "background. Do not write words or labels on the picture unless the "
+    "description asks for them.\nDescription: "
+)
+# Telegram allows 1024 characters in a caption, and these models like to add a
+# paragraph describing what they drew.
+MAX_CAPTION_CHARS = 900
+
 FALLBACK_DELAY_SECONDS = 1.5
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
 # A busy group can fire many requests at once; this keeps us inside the API's
@@ -83,11 +102,70 @@ def _is_unavailable(exc: Exception) -> bool:
     return name in {"ServerError", "ResourceExhausted", "ServiceUnavailable"}
 
 
+def _response_text(response: Any) -> str:
+    """The text of a response, tolerating a model that returned only a picture.
+
+    Reading .text is not guaranteed to work on a multimodal reply, and an
+    exception here would look like a model failure and start the whole chain.
+    """
+    try:
+        return (response.text or "").strip()
+    except Exception:
+        logger.debug("response had no readable text", exc_info=True)
+        return ""
+
+
+def _first_image(response: Any) -> tuple[bytes, str]:
+    """The first inline picture in a multimodal response, as (bytes, mime)."""
+    for candidate in getattr(response, "candidates", None) or ():
+        content = getattr(candidate, "content", None)
+        for part in (getattr(content, "parts", None) or ()) if content else ():
+            blob = getattr(part, "inline_data", None)
+            data = getattr(blob, "data", None) if blob is not None else None
+            if data:
+                return bytes(data), getattr(blob, "mime_type", None) or "image/png"
+    return b"", "image/png"
+
+
 class GeminiClient:
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(self, api_key: str, model: str, image_model: str = "") -> None:
         self.client = genai.Client(api_key=api_key)
         self.model = model
         self.models = (model,) + tuple(m for m in FALLBACK_MODELS if m != model)
+        primary_image = image_model or IMAGE_MODELS[0]
+        self.image_model = primary_image
+        self.image_models = (primary_image,) + tuple(m for m in IMAGE_MODELS
+                                                     if m != primary_image)
+
+    async def _run(self, models: Sequence[str],
+                   contents: list[types.Content]) -> tuple[str, Any]:
+        """Ask each model in turn and return the first (text, raw response).
+
+        The response is handed back whole because a drawing model reports its
+        picture outside .text, and an empty text answer is not an error here:
+        the caller decides what counts as a usable reply.
+        """
+        last: Exception | None = None
+        gate = _call_gate()
+        for index, model in enumerate(models):
+            try:
+                async with gate:
+                    response = await self.client.aio.models.generate_content(
+                        model=model, contents=contents)
+            except Exception as exc:
+                if not _is_unavailable(exc):
+                    raise
+                last = exc
+                logger.warning("Model %s unavailable (%s: %s), trying fallback",
+                               model, type(exc).__name__, _brief(exc))
+                if index < len(models) - 1:
+                    await asyncio.sleep(FALLBACK_DELAY_SECONDS)
+                continue
+            if index:
+                logger.info("Answered using fallback model %s", model)
+            return _response_text(response), response
+        raise GeminiUnavailableError(
+            f"All Gemini models unavailable; last error: {_brief(last)}") from last
 
     async def _complete(self, parts: list[types.Part | str],
                         system_prompt: str | None = SYSTEM_PROMPT,
@@ -111,32 +189,12 @@ class GeminiClient:
             contents.append(types.Content(role="model", parts=[types.Part(text=answer)]))
         contents.append(types.Content(role="user", parts=content_parts))
 
-        last: Exception | None = None
-        gate = _call_gate()
-        for index, model in enumerate(self.models):
-            try:
-                async with gate:
-                    response = await self.client.aio.models.generate_content(
-                        model=model, contents=contents)
-            except Exception as exc:
-                if not _is_unavailable(exc):
-                    raise
-                last = exc
-                logger.warning("Model %s unavailable (%s: %s), trying fallback",
-                               model, type(exc).__name__, _brief(exc))
-                if index < len(self.models) - 1:
-                    await asyncio.sleep(FALLBACK_DELAY_SECONDS)
-                continue
-            text = (response.text or "").strip()
-            if not text:
-                if allow_empty:
-                    return ""
-                raise RuntimeError(empty_message)
-            if index:
-                logger.info("Answered using fallback model %s", model)
-            return text
-        raise GeminiUnavailableError(
-            f"All Gemini models unavailable; last error: {_brief(last)}") from last
+        text, _response = await self._run(self.models, contents)
+        if not text:
+            if allow_empty:
+                return ""
+            raise RuntimeError(empty_message)
+        return text
 
     async def _generate(self, parts: list[types.Part | str],
                         history: Sequence[Turn] = ()) -> str:
@@ -158,6 +216,21 @@ class GeminiClient:
              types.Part.from_bytes(data=image_bytes, mime_type=mime_type)],
             system_prompt=None, allow_empty=True)
         return text.strip().upper().startswith("YES")
+
+    async def generate_image(self, prompt: str) -> tuple[bytes, str, str]:
+        """Draw a picture and return (bytes, mime_type, caption).
+
+        A model that answers in words instead of returning a picture is a
+        failure here, not something to store: the caller has nothing to send.
+        """
+        contents = [types.Content(role="user",
+                                  parts=[types.Part(text=IMAGE_PROMPT + prompt)])]
+        text, response = await self._run(self.image_models, contents)
+        data, mime_type = _first_image(response)
+        if not data:
+            raise RuntimeError(f"{self.image_model} answered with text only: {text[:80]}")
+        caption = (text or prompt).strip()[:MAX_CAPTION_CHARS]
+        return data, mime_type, caption
 
     async def answer_voice(self, audio_bytes: bytes, mime_type: str,
                            history: Sequence[Turn] = ()) -> tuple[str, str]:

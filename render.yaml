@@ -44,6 +44,11 @@ services:
       # gemini_client.py still falls back to the rest of the chain on failure.
       - key: GEMINI_MODEL
         value: "gemini-3.5-flash-lite"
+      # Drawing (/image, "ارسم", "سوي صورة") needs a different family of model:
+      # the text models above answer in words and never return a picture.
+      # gemini_client.py falls back down IMAGE_MODELS when this one is busy.
+      - key: GEMINI_IMAGE_MODEL
+        value: "gemini-3.1-flash-lite-image"
       # This one has a working default in config.py:
       #   DATABASE_PATH   -> data/edu_bot.db
       # PORT is supplied by Render and is read by bot.py.
