@@ -146,6 +146,31 @@ async def reply_answer(message, text: str) -> None:
                 await asyncio.sleep(wait)
 
 
+# Words that wake the bot up in a group, matched as whole words so that
+# "paleo" and "cleopatra" do not trip it. The Arabic spelling is matched after
+# diacritics are dropped, otherwise "ليُو" with a harakah would slip past.
+_NAME_WORDS = ("leo", "ليو")
+_DIACRITIC_RANGES = ((0x064B, 0x0652), (0x0670, 0x0670), (0x06D6, 0x06ED))
+_NAME_RE = re.compile(r"(?<!\w)(?:" + "|".join(_NAME_WORDS) + r")(?!\w)", re.IGNORECASE)
+
+
+def _without_diacritics(text: str) -> str:
+    return "".join(
+        ch for ch in text
+        if not any(low <= ord(ch) <= high for low, high in _DIACRITIC_RANGES)
+    )
+
+
+def is_name_call(text: str) -> bool:
+    """True when the message says the bot's name as a whole word.
+
+    Students do not always bother with the @handle, so in a group a plain
+    "leo" or "ليو" is enough. Word boundaries matter: without them every
+    message mentioning paleontology or Cleopatra would wake the bot.
+    """
+    return bool(_NAME_RE.search(_without_diacritics(text)))
+
+
 def directed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     message = update.effective_message
     if not message:
@@ -154,10 +179,12 @@ def directed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         return True
     bot_username = context.bot.username or ""
     mention = f"@{bot_username.lower()}" if bot_username else ""
-    text = (message.text or message.caption or "").lower()
+    text = message.text or message.caption or ""
     return bool(
-        (mention and mention in text)
-        or (message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == context.bot.id)
+        (mention and mention.lower() in text.lower())
+        or is_name_call(text)
+        or (message.reply_to_message and message.reply_to_message.from_user
+            and message.reply_to_message.from_user.id == context.bot.id)
     )
 
 
@@ -165,14 +192,18 @@ def clean_prompt(text: str, bot_username: str = "") -> str:
     """Strip the bot mention and clamp to the configured limit."""
     if bot_username:
         text = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE)
-    return text.strip()[: settings.max_message_chars]
+    # A bare "leo" is a wake-up call, not part of the question, so it should
+    # never reach the model as content.
+    text = _NAME_RE.sub("", _without_diacritics(text))
+    text = re.sub(r"\s{2,}", " ", text).strip(" -:،,")
+    return text[: settings.max_message_chars]
 
 
 @allowed_chat_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "هلا بيك! آني Leo، كيف أساعدك اليوم؟ "
-        "دز سؤالك بالنص، صورة، أو رسالة صوتية، ووجّهها إليّ بالمجموعة بذكر اسمي أو بالرد على رسالتي."
+        "دز سؤالك بالنص، صورة، أو رسالة صوتية، ووجّهها إليّ بالمجموعة بكتابة اسمي (leo أو ليو) أو بالرد على رسالتي."
     )
 
 
@@ -180,7 +211,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "الأوامر المتاحة:\n/start - بدء الاستخدام\n/help - المساعدة\n/privacy - الخصوصية\n/status - حالة الخدمة\n/cancel - إلغاء العملية الحالية\n"
-        "بالمجموعة ما أرد على كل الرسائل؛ لازم تذكرني أو ترد على رسالتي.\n\n"
+        "بالمجموعة ما أرد على كل الرسائل؛ اكتب اسمي (leo أو ليو) بالسؤال، أو رد على رسالتي.\n\n"
         "تنظيم الحصص (للمدير):\n/newlesson العنوان | التاريخ | الوقت | السعة\n"
         "/addstudent رقم_الحصة | رمز_الطالب\n/roster رقم_الحصة\n"
         "ولكل الطلاب: /lessons لعرض الحصص والمقاعد المتبقية."
