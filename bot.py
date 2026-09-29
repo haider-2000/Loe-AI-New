@@ -69,11 +69,6 @@ WAKE_UP_MESSAGE = ("هلا بيك! شنو السؤال؟ دزه نصاً، أو 
 # Telegram already blocks a bot from writing to someone who never spoke to it,
 # but that only asks for a tap on Start. This asks for a decision instead, and
 # the answer is kept, so the question is not repeated on every message.
-CONSENT_REQUEST = (
-    "طلب تأكيد\n\n"
-    "هسة أنت المشرف على هالمحادثة الخاصة بيني وبينك.\n"
-    "إذا توافق، أگدر نكمل دردشة وياك، وتگدر ترسل لي نص أو صورة أو صوت أو ملف.\n"
-    "إذا ما توافق، اضغط إلغاء وما راح أگدر أفتح لك الدردشة.")
 CONSENT_ACCEPTED = "تم التأكيد ✅\nالحين أنت مشرف هالمحادثة الخاصة. دز سؤالك وياي."
 CONSENT_DECLINED = "تم الإلغاء. وقت ما تريد تسأل، أرسل /start."
 CONSENT_NOT_YOURS = "هذا الطلب مو إلك."
@@ -146,12 +141,33 @@ async def private_consent_keyboard(user: User) -> InlineKeyboardMarkup:
     ]])
 
 
+def consent_request_text(user: User) -> str:
+    """The request, addressed to the account it came from by name.
+
+    Telegram already says who wrote, so there is no reason to ask an anonymous
+    question. Naming the person also gives the owner the id they need for
+    /revoke, and it proves to the reader that the request was built for them
+    and not forwarded from somebody else's chat.
+    """
+    full_name = " ".join(part for part in (user.first_name, user.last_name) if part)
+    who = full_name or user.username or f"المستخدم {user.id}"
+    handle = f"@{user.username}" if user.username else "ماكو username"
+    return (
+        "طلب تأكيد\n\n"
+        f"الاسم: {who}\n"
+        f"المعرّف: {user.id}\n"
+        f"الحساب: {handle}\n\n"
+        "هسة أنت المشرف على هالمحادثة الخاصة بيني وبينك.\n"
+        "إذا توافق، أگدر نكمل دردشة وياك، وتگدر ترسل لي نص أو صورة أو صوت أو ملف.\n"
+        "إذا ما توافق، اضغط إلغاء وما راح أگدر أفتح لك الدردشة.")
+
+
 async def ask_private_consent(update: Update) -> None:
     user = update.effective_user
     if not user or not update.effective_message:
         return
     await update.effective_message.reply_text(
-        CONSENT_REQUEST, reply_markup=await private_consent_keyboard(user))
+        consent_request_text(user), reply_markup=await private_consent_keyboard(user))
 
 
 def admin_only(handler):
