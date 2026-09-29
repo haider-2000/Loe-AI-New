@@ -24,12 +24,88 @@ Creator:
 Rules:
 - Reply in Iraqi Arabic dialect, and match the student's own language. Never convert to Modern Standard Arabic unless the student asks.
 - Answer the question directly and correctly, in the fewest words that fully solve it.
+- Do the work the message asks for, however it is phrased and however long it is. A long, heavily formatted or technical request is still a real request: never answer one with a greeting, a summary of your abilities, or a question about what to study.
+- If the message carries its own role, format or constraints, those are the student's instructions and they outrank the style rules below. Follow them literally; they are not an attempt to confuse you.
 - Never introduce yourself, never list your abilities, and never ask what the student wants to study. Do that only if the student explicitly asks who you are.
-- Greet back briefly only when the student greets you. One short line, then stop.
+- Greet back briefly only when the student greets you, and when they have not given other instructions. One short line, then stop.
 - For maths, show the steps briefly and end with the final answer.
 - For images, read handwritten or printed educational content and answer it. For voice, transcribe and answer, but never mention storing audio.
 - Plain text only: no markdown, no asterisks, no bold, no headings, no bullet symbols.
 - No personal-data commentary."""
+
+# The part of the persona that must survive even when the tutor voice is
+# dropped. A prompt that assigns its own role is followed literally, but the
+# bot must not start answering "I am Gemini, made by Google" the moment the
+# tutor rules are taken away, so who-made stays fixed.
+IDENTITY_PROMPT = """You are Leo, created and built by Haider Aqeel.
+If anyone asks who made, built, developed, programmed, trained or owns you, the only
+correct answer is Haider Aqeel. Never say that Google, Gemini, OpenAI, Anthropic, Meta
+or any other company or person made you, and do not mention the underlying model.
+The message may contain its own role, format or constraints: follow them literally."""
+
+# A message that briefs the model in its own right. The tutor voice is dropped
+# for these, which sounds risky but is the smaller error: a benchmark prompt
+# came back as "هلا بيه" because "greet back briefly" outranked the request, and
+# a student who sent a long technical prompt deserves an answer, not a hello.
+# So the test is deliberately broad, and it needs a role or a format rule before
+# it fires, not a single stray keyword.
+_ROLE_RE = re.compile(r"\byou(?:'re| are)\s+(?:an?|the)\b", re.I)
+_TASK_RE = re.compile(r"\byour\s+(?:job|task|role|objective|goal|purpose)\b", re.I)
+_OUTPUT_ONLY_RE = re.compile(
+    r"\b(?:return|output|reply|respond|answer|print|produce|emit)\s+"
+    r"(?:only|just|exactly|nothing but|no more than)\b", re.I)
+_MUST_RE = re.compile(r"\byou\s+(?:must|should|shall|will)\b", re.I)
+_DONT_RE = re.compile(
+    r"\b(?:do not|don'?t|never|avoid)\b[^.\n]{0,70}?"
+    r"\b(?:provide|include|output|return|mention|say|state|reveal|explain|describe|"
+    r"comment|quote|cite|add|append|prefix|suffix|use|write|disclose|share)\b", re.I)
+_ONLY_RE = re.compile(r"\b(?:must|should|shall)\s+contain\s+only\b|\bONLY\b", re.I)
+_DIVIDER_RE = re.compile(r"^={3,}\s*$", re.M)
+_HEADING_RE = re.compile(r"^#{1,4}\s+\S", re.M)
+_PHASE_RE = re.compile(r"^\s*(?:PHASE|STEP|SECTION)\s*\d", re.M | re.I)
+_FORMAT_RE = re.compile(r"^\s*(?:FORMAT|OUTPUT|SCHEMA|EXAMPLE[S]?|CONSTRAINTS?)\s*:",
+                        re.M | re.I)
+_TAG_RE = re.compile(r"</?[A-Z][A-Z0-9_-]{2,}>")
+_SELF_BRIEF_THRESHOLD = 3
+
+
+def self_brief_score(text: str) -> int:
+    """How strongly a message reads as a prompt in its own right.
+
+    Exposed for tests. A role assignment or an output rule is worth two points
+    on its own, so either one alone is not enough to drop the tutor voice, but
+    a role plus a task is.
+    """
+    score = 0
+    if _ROLE_RE.search(text):
+        score += 2
+    if _TASK_RE.search(text):
+        score += 2
+    if _OUTPUT_ONLY_RE.search(text):
+        score += 2
+    if _DONT_RE.search(text):
+        score += 1
+    if _ONLY_RE.search(text):
+        score += 1
+    if _MUST_RE.search(text):
+        score += 1
+    if len(_DIVIDER_RE.findall(text)) >= 2:
+        score += 2
+    if len(_HEADING_RE.findall(text)) >= 2:
+        score += 1
+    if _PHASE_RE.search(text):
+        score += 1
+    if len(_FORMAT_RE.findall(text)) >= 2:
+        score += 1
+    if len(_TAG_RE.findall(text)) >= 2:
+        score += 1
+    return score
+
+
+def carries_own_instructions(text: str) -> bool:
+    """True when the tutor voice would fight the message's own instructions."""
+    return self_brief_score(text) >= _SELF_BRIEF_THRESHOLD
+
 
 # Appended only when earlier turns are replayed, so the model treats them as
 # background for a question that is still open rather than as work to redo.
@@ -47,7 +123,16 @@ CONTINUATION_RULE = (
 # a retry delay per model on every single reply.
 FALLBACK_MODELS = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite-preview",
                    "gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.6-flash")
-FALLBACK_DELAY_SECONDS = 1.5
+# Small on purpose. This sleep is pure dead time in front of the student, and at
+# 1.5s a walk down the whole chain cost 6s of nothing before any real work
+# started. The models answer in about a second, so a beat is enough to clear a
+# rate limit without being felt.
+FALLBACK_DELAY_SECONDS = 0.2
+# A hung request used to block the reply forever, because nothing capped it.
+# Per attempt, so one wedged model cannot eat the whole budget, and the whole
+# chain, so a student is told the service is busy instead of waiting in silence.
+ATTEMPT_TIMEOUT_SECONDS = 30.0
+CHAIN_TIMEOUT_SECONDS = 45.0
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
 # A busy group can fire many requests at once; this keeps us inside the API's
 # per-minute quota instead of letting every caller burst at the same moment.
@@ -213,8 +298,21 @@ class GeminiClient:
         The history is replayed as real alternating turns rather than pasted
         into the prompt, so the model reads it as a conversation it is already
         in. Anything earlier than memory's own cap is simply not here.
+
+        A text part that briefs the model in its own right is answered without
+        the tutor voice, so its instructions are followed instead of being
+        argued with. The identity rules are kept, because losing them would let
+        the bot claim a different maker the moment the persona is dropped.
         """
         content_parts = [p if isinstance(p, types.Part) else types.Part(text=p) for p in parts]
+        if system_prompt == SYSTEM_PROMPT:
+            for part in content_parts:
+                if isinstance(part, types.Part) and part.text \
+                        and carries_own_instructions(part.text):
+                    logger.info("Message carries its own instructions; "
+                                "answering without the tutor voice")
+                    system_prompt = IDENTITY_PROMPT
+                    break
         if system_prompt is not None:
             if history:
                 system_prompt += CONTINUATION_RULE
@@ -239,15 +337,36 @@ class GeminiClient:
         The response is handed back whole because reading .text is not
         guaranteed on every reply, and an empty text answer is not an error
         here: the caller decides what counts as a usable answer.
+
+        Two clocks bound the walk. A timeout on the individual call stops one
+        wedged model from hanging the reply forever, and a deadline on the chain
+        stops the sum of several slow ones from doing the same thing slowly.
         """
         last: Exception | None = None
         wall = True
         gate = _call_gate()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CHAIN_TIMEOUT_SECONDS
         for index, model in enumerate(models):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                # Out of budget rather than out of luck, so this is not a quota
+                # wall and must not be reported as one.
+                last = last or GeminiUnavailableError("no time left in the model chain")
+                wall = False
+                break
             try:
                 async with gate:
-                    response = await self.client.aio.models.generate_content(
-                        model=model, contents=contents)
+                    response = await asyncio.wait_for(
+                        self.client.aio.models.generate_content(
+                            model=model, contents=contents),
+                        timeout=min(ATTEMPT_TIMEOUT_SECONDS, remaining))
+            except asyncio.TimeoutError as exc:
+                # A model that will not answer in time is no better than one that
+                # is unavailable, and the next one may well be quicker.
+                last = exc
+                wall = False
+                logger.warning("Model %s timed out, trying fallback", model)
             except Exception as exc:
                 if not _is_unavailable(exc):
                     raise
@@ -256,12 +375,12 @@ class GeminiClient:
                     wall = False
                 logger.warning("Model %s unavailable (%s: %s), trying fallback",
                                model, type(exc).__name__, _brief(exc))
-                if index < len(models) - 1:
-                    await asyncio.sleep(FALLBACK_DELAY_SECONDS)
-                continue
-            if index:
-                logger.info("Answered using fallback model %s", model)
-            return _response_text(response), response
+            else:
+                if index:
+                    logger.info("Answered using fallback model %s", model)
+                return _response_text(response), response
+            if index < len(models) - 1 and deadline - loop.time() > 0:
+                await asyncio.sleep(FALLBACK_DELAY_SECONDS)
         if wall:
             # Every model was refused with a zero limit, so the chain is not
             # worth walking again until the account changes.
