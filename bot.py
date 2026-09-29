@@ -20,7 +20,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, User
 from telegram.constants import ChatType
 from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
-                          MessageHandler, filters)
+                          MessageHandler, TypeHandler, filters)
 
 from config import Settings
 from database import (all_rows, count_by_status, create_lesson, create_quiz_session,
@@ -392,6 +392,36 @@ def is_name_call(text: str) -> bool:
     message mentioning paleontology or Cleopatra would wake the bot.
     """
     return bool(_name_spans(text))
+
+
+async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Record that an update arrived at all, whatever it turned out to be.
+
+    The routing log inside directed_to_bot only fires for a message that
+    reached a handler. If Telegram delivers something this bot has no handler
+    for -- an edited message, a poll, a giveaway -- that leaves no trace at all,
+    and a group that has gone quiet cannot be told apart from one whose messages
+    never arrived. Registered with block=False, so it observes without taking
+    the update away from whoever is supposed to answer it. The shape is logged,
+    never the text.
+    """
+    chat = update.effective_chat
+    message = update.effective_message
+    kind = "message"
+    if update.callback_query is not None:
+        kind = "callback"
+    elif update.edited_message is not None:
+        kind = "edited"
+    elif update.channel_post is not None:
+        kind = "channel"
+    elif update.message is None:
+        kind = "other"
+    text = (getattr(message, "text", None) or getattr(message, "caption", None) or "")
+    logger.info(
+        "update %s: %s chat=%s type=%s %d char(s) reply=%s",
+        getattr(update, "update_id", None), kind,
+        getattr(chat, "id", None), getattr(chat, "type", None), len(text),
+        "yes" if getattr(message, "reply_to_message", None) else "no")
 
 
 def directed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1521,6 +1551,9 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(quiz_answered, pattern=r"^qa:"))
     application.add_handler(CallbackQueryHandler(private_consent_answered,
                                                  pattern=r"^priv(?:ok|no):\d+$"))
+    # First, and with block=False: it only watches, so a message no other
+    # handler wants is still visible in the log instead of vanishing.
+    application.add_handler(TypeHandler(Update, log_arriving_update, block=False))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
