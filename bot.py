@@ -395,6 +395,14 @@ def is_name_call(text: str) -> bool:
 
 
 def directed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Whether this message is the bot being spoken to, and why.
+
+    In a group there are three ways in, and they are checked in the order a
+    student is most likely to use them. Every decision is logged with the chat
+    and the reason but never the text: a group going quiet produces no visible
+    trace at all, so the log is the only place left to look, and a student's
+    question has no business being written to disk just to explain routing.
+    """
     message = update.effective_message
     if not message:
         return False
@@ -403,12 +411,21 @@ def directed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     bot_username = context.bot.username or ""
     mention = f"@{bot_username.lower()}" if bot_username else ""
     text = message.text or message.caption or ""
-    return bool(
-        (mention and mention.lower() in text.lower())
-        or is_name_call(text)
-        or (message.reply_to_message and message.reply_to_message.from_user
-            and message.reply_to_message.from_user.id == context.bot.id)
-    )
+    if mention and mention.lower() in text.lower():
+        reason = "mention"
+    elif is_name_call(text):
+        reason = "name"
+    elif (message.reply_to_message and message.reply_to_message.from_user
+          and message.reply_to_message.from_user.id == context.bot.id):
+        reason = "reply"
+    else:
+        reason = "no"
+    logger.info(
+        "group %s: msg %s, %d char(s), bot username %s -> %s",
+        getattr(message.chat, "title", None) or message.chat.id,
+        getattr(message, "message_id", None), len(text),
+        bot_username or "(none)", reason)
+    return reason != "no"
 
 
 def clean_prompt(text: str, bot_username: str = "") -> str:
@@ -931,9 +948,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     raw = message.text or ""
     text = clean_prompt(raw, context.bot.username or "")
     if not text:
-        # Somebody said just "ليو". Answering nothing reads as a broken bot, so
-        # the wake-up call is acknowledged the way /start is.
-        if raw.strip() and is_name_call(raw):
+        # Somebody wrote just "ليو", or just the @handle with nothing after it.
+        # Answering nothing reads as a broken bot, so the wake-up call is
+        # acknowledged the way /start is. Reaching here already means the
+        # message was directed at the bot, so no name check is needed: that
+        # check is what used to leave a bare "@handle" in silence, because a
+        # handle is not the word "ليو" and never matched the name pattern.
+        if raw.strip():
             await message.reply_text(WAKE_UP_MESSAGE)
         return
     key = thread_key(update)
