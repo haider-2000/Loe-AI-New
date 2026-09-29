@@ -70,6 +70,10 @@ WAKE_UP_MESSAGE = ("هلا بيك! شنو السؤال؟ دزه نصاً، أو 
 # keeps the file, so the bytes only need a second home inside the database when
 # that disk is wiped on every restart.
 database_is_remote = True
+# Whether Telegram hands the bot every plain group message. It only does so when
+# privacy mode is off, and a message it never receives can never be answered, so
+# this is looked up once at startup rather than left to be discovered by students.
+reads_all_group_messages: bool | None = None
 # Set by start_health_server when the platform gave us a port to listen on.
 health_port: int | None = None
 
@@ -405,7 +409,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "الأوامر المتاحة:\n/start - بدء الاستخدام\n/help - المساعدة\n/privacy - الخصوصية\n/status - حالة الخدمة\n/quiz الموضوع - اختبار\n/progress - نتائجك\n/forget - نسيان آخر المواضيع\n/cancel - إلغاء العملية الحالية\n"
-        "بالمجموعة ما أرد على كل الرسائل؛ اكتب اسمي (leo أو ليو) بالسؤال، أو رد على رسالتي.\n\n"
+        "بالمجموعة ما أرد على كل الرسائل؛ اكتب اسمي (leo أو ليو) بأول السؤال، أو رد على رسالتي.\n\n"
         "وتكتب /quiz تطلع لك قائمة باختصاصات الذكاء الاصطناعي تختار منها، أو تكتب /quiz الموضوع مباشرة مثل /quiz تعلم الآلة.\n"
         "كل اختبار ٥ أسئلة اختيار من متعدد، تجاوب بالأزرار (أ ب ج د) وتعرف النتيجة مع شرح ليش جوابك صح أو غلط.\n"
         "النتائج تنحفظ لكل طالب لحاله وتگدر تشوفها بـ /progress.\n\n"
@@ -452,7 +456,18 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     counts = await count_by_status(settings.database_path)
     summary = ", ".join(f"{key}: {value}" for key, value in sorted(counts.items())) or "لا توجد إدخالات بعد"
-    await update.effective_message.reply_text(f"الخدمة تعمل. حالات البيانات: {summary}")
+    # Reported here because this is the one reason a name call in a group can
+    # get no answer at all, and it cannot be seen from inside a message that was
+    # never delivered.
+    if reads_all_group_messages is False:
+        reach = ("\nتحذير: تيليجرام ما يوصلني إلا المنشن والأوامر. "
+                 "لازم تطفي Privacy Mode من @BotFather: /setprivacy ثم اختر البوت ثم Disable، "
+                 "وبعدين أعيد تشغيل البوت. لينها، «ليو سؤال» بالمجموعة ما راح يوصلني.")
+    elif reads_all_group_messages:
+        reach = "\n📨 أقرأ كل رسائل المجموعات، فـ«ليو سؤال» يوصلني بدون منشن."
+    else:
+        reach = ""
+    await update.effective_message.reply_text(f"الخدمة تعمل. حالات البيانات: {summary}{reach}")
 
 
 @allowed_chat_only
@@ -1230,6 +1245,34 @@ async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text("\n".join(lines))
 
 
+async def check_group_privacy_mode(bot_api) -> bool | None:
+    """Look up whether Telegram delivers plain group messages to this bot.
+
+    With privacy mode on, Telegram never sends an ordinary message that does not
+    mention the bot, so a student writing "ليو" gets no answer at all and there
+    is nothing in the bot's own logs to explain why. The Bot API reports the
+    setting, so the question is asked once here instead of being left to guess
+    work. A failure to ask is not fatal and reports None.
+    """
+    global reads_all_group_messages
+    try:
+        me = await bot_api.get_me()
+    except Exception:
+        logger.warning("Could not read the bot's privacy setting", exc_info=True)
+        reads_all_group_messages = None
+        return None
+    reads_all_group_messages = bool(getattr(me, "can_read_all_group_messages", None))
+    if reads_all_group_messages is False:
+        logger.warning(
+            "Telegram privacy mode is ON: plain group messages never reach this "
+            "bot, so writing 'ليو' in a group will get no answer. Fix it in "
+            "BotFather: /setprivacy -> pick the bot -> Disable, then restart the "
+            "bot so the new setting applies.")
+    else:
+        logger.info("Telegram privacy mode is off, so name calls in a group will be answered")
+    return reads_all_group_messages
+
+
 async def post_init(application: Application) -> None:
     global database_is_remote
     for directory in ("data/raw/images", "data/raw/text", "data/raw/documents", "data/exports",
@@ -1244,6 +1287,8 @@ async def post_init(application: Application) -> None:
         " (restored from seed/)" if restored else "",
         f" ({images_back} image(s) restored from the database)" if images_back else "",
     )
+    if application is not None:
+        await check_group_privacy_mode(application.bot)
     if health_port:
         application.create_task(keep_awake(health_port))
     minutes = int(os.getenv("AUTO_BACKUP_MINUTES", "0") or 0)
