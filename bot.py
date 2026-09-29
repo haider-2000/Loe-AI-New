@@ -407,12 +407,23 @@ async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     chat = update.effective_chat
     message = update.effective_message
+    if getattr(update, "my_chat_member", None) is not None:
+        # The one update that says whether the bot is even in this chat. A
+        # group the bot was never added to produces no messages at all, and
+        # without this there is no way to tell that from a routing mistake.
+        change = update.my_chat_member
+        logger.info("update %s: my_chat_member chat=%s title=%r status=%s -> %s",
+                    getattr(update, "update_id", None),
+                    getattr(chat, "id", None), getattr(chat, "title", None),
+                    getattr(change.old_chat_member, "status", None),
+                    getattr(change.new_chat_member, "status", None))
+        return
     kind = "message"
     if update.callback_query is not None:
         kind = "callback"
-    elif update.edited_message is not None:
+    elif getattr(update, "edited_message", None) is not None:
         kind = "edited"
-    elif update.channel_post is not None:
+    elif getattr(update, "channel_post", None) is not None:
         kind = "channel"
     elif update.message is None:
         kind = "other"
@@ -635,7 +646,16 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reach = "\n📨 أقرأ كل رسائل المجموعات، فـ«ليو سؤال» يوصلني بدون منشن."
     else:
         reach = ""
-    await update.effective_message.reply_text(f"الخدمة تعمل. حالات البيانات: {summary}{reach}")
+    # A group that goes quiet is almost always the wrong group, and the chat id
+    # is the only thing that settles it. Naming the chat here means the answer
+    # comes back in Telegram instead of from a log nobody has open.
+    chat = update.effective_chat
+    where = ""
+    if chat.type != ChatType.PRIVATE:
+        where = (f"🧭 هالمحادثة: {getattr(chat, 'title', None) or chat.id} "
+                 f"— المعرّف: {chat.id}\n")
+    await update.effective_message.reply_text(
+        f"{where}الخدمة تعمل. حالات البيانات: {summary}{reach}")
 
 
 @admin_only
