@@ -1262,6 +1262,10 @@ async def check_group_privacy_mode(bot_api) -> bool | None:
         reads_all_group_messages = None
         return None
     reads_all_group_messages = bool(getattr(me, "can_read_all_group_messages", None))
+    # The username belongs in the log on purpose: when a group goes quiet, the
+    # first question is which bot answered, and a stale token in the platform's
+    # settings starts a second, different bot on the same service.
+    logger.info("Running as @%s", getattr(me, "username", None))
     if reads_all_group_messages is False:
         logger.warning(
             "Telegram privacy mode is ON: plain group messages never reach this "
@@ -1333,7 +1337,6 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     logger.info("Leo starting with model %s", settings.gemini_model)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
