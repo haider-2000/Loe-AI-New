@@ -60,6 +60,11 @@ UNSUPPORTED_DOCUMENT_MESSAGE = (
     "ما أگدر أقرأ هذا النوع من الملفات. أرسل PDF أو صورة (JPG/PNG) "
     "أو GIF أو مقطع MP4.")
 
+# Sent when someone calls the name without asking anything, which happens when
+# they expect a chat to open rather than a one-shot answer.
+WAKE_UP_MESSAGE = ("هلا بيك! شنو السؤال؟ دزه نصاً، أو صورة، أو صوت، "
+                   "وأنا جاوبك.")
+
 # Whether the *database* lives somewhere ephemeral, like a Render container.
 # The name matters: it says nothing about the image bytes. A local disk already
 # keeps the file, so the bytes only need a second home inside the database when
@@ -213,17 +218,45 @@ async def reply_answer(message, text: str) -> None:
 
 # Words that wake the bot up in a group, matched as whole words so that
 # "paleo" and "cleopatra" do not trip it. The Arabic spelling is matched after
-# diacritics are dropped, otherwise "ليُو" with a harakah would slip past.
+# folding, otherwise "ليُو" with a harakah, a Persian yeh, or the doubled waw of
+# a fast typist would all slip past and the bot would ignore its own name.
 _NAME_WORDS = ("leo", "ليو")
 _DIACRITIC_RANGES = ((0x064B, 0x0652), (0x0670, 0x0670), (0x06D6, 0x06ED))
-_NAME_RE = re.compile(r"(?<!\w)(?:" + "|".join(_NAME_WORDS) + r")(?!\w)", re.IGNORECASE)
+# Spellings that mean the same letter to a reader but not to a regex. Arabic
+# keyboards disagree about yeh, and plenty of phones emit the Persian one.
+_LETTER_FOLD = {
+    "\u06CC": "\u064A",  # yeh  -> yeh
+    "\u0649": "\u064A",  # alef maksura -> yeh
+    "\u06D2": "\u064A",  # yeh barree -> yeh
+    "\u06C6": "\u0648",  # waw with hamza above -> waw
+    "\u06C0": "\u0647",  # heh with yeh above -> heh
+    "\u06A9": "\u0643",  # keheh -> kaf
+    "\u06AF": "\u0643",  # gaf -> kaf
+}
+# The waw is optional and repeatable so "ليو", "ليوو" and "ليؤو" are all the
+# name, while the closing boundary keeps a word that merely starts with it out.
+_NAME_RE = re.compile(
+    r"(?<!\w)(?:leo|لي[وؤ][وؤ]?)(?!\w)", re.IGNORECASE)
 
 
-def _without_diacritics(text: str) -> str:
-    return "".join(
-        ch for ch in text
-        if not any(low <= ord(ch) <= high for low, high in _DIACRITIC_RANGES)
-    )
+def _fold(text: str) -> str:
+    """Strip diacritics and unify letter variants for matching.
+
+    Length is preserved, one character in and one out, so a name matched here
+    can be cut out of the original text and leave the student's own spelling
+    of the rest of the message untouched.
+    """
+    out = []
+    for ch in text:
+        if any(low <= ord(ch) <= high for low, high in _DIACRITIC_RANGES):
+            continue
+        out.append(_LETTER_FOLD.get(ch, ch))
+    return "".join(out)
+
+
+def _name_spans(text: str) -> list[tuple[int, int]]:
+    """Where the bot's name appears, found in the folded text."""
+    return [match.span() for match in _NAME_RE.finditer(_fold(text))]
 
 
 def is_name_call(text: str) -> bool:
@@ -233,7 +266,7 @@ def is_name_call(text: str) -> bool:
     "leo" or "ليو" is enough. Word boundaries matter: without them every
     message mentioning paleontology or Cleopatra would wake the bot.
     """
-    return bool(_NAME_RE.search(_without_diacritics(text)))
+    return bool(_NAME_RE.search(_fold(text)))
 
 
 def directed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -258,8 +291,17 @@ def clean_prompt(text: str, bot_username: str = "") -> str:
     if bot_username:
         text = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE)
     # A bare "leo" is a wake-up call, not part of the question, so it should
-    # never reach the model as content.
-    text = _NAME_RE.sub("", _without_diacritics(text))
+    # never reach the model as content. The span is located in the folded text
+    # but cut from the original, so a message written with a Persian yeh loses
+    # exactly its own name and keeps the rest of its spelling.
+    spans = _name_spans(text)
+    if spans:
+        pieces, cursor = [], 0
+        for start, end in spans:
+            pieces.append(text[cursor:start])
+            cursor = end
+        pieces.append(text[cursor:])
+        text = "".join(pieces)
     text = re.sub(r"\s{2,}", " ", text).strip(" -:،,")
     return text[: settings.max_message_chars]
 
@@ -706,8 +748,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not directed_to_bot(update, context):
         return
     message = update.effective_message
-    text = clean_prompt(message.text or "", context.bot.username or "")
+    raw = message.text or ""
+    text = clean_prompt(raw, context.bot.username or "")
     if not text:
+        # Somebody said just "ليو". Answering nothing reads as a broken bot, so
+        # the wake-up call is acknowledged the way /start is.
+        if raw.strip() and is_name_call(raw):
+            await message.reply_text(WAKE_UP_MESSAGE)
         return
     key = thread_key(update)
     try:
