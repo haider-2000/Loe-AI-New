@@ -101,22 +101,26 @@ def is_admin(update: Update) -> bool:
 
 
 def allowed_chat_only(handler):
-    """Serve every group the bot is a member of.
+    """Serve every group the bot is a member of, and every private chat.
 
     There is no group allowlist any more: any group or supergroup that adds the
     bot gets an answer, so a new class does not need a deployment first. Private
-    chats stay reserved for the owner, which is where /backup lives and where
-    the bot gets driven by hand.
+    chats are open to anyone as well, so a student can ask in direct messages
+    instead of hunting for the group first.
+
+    The private commands that touch stored data -- /backup, /export, /approve and
+    the rest of the teacher's tools -- are *not* protected by that. They used to
+    be, but only by accident: a private chat used to be the owner's by
+    definition, so "is this a private chat" was standing in for "is this the
+    admin". The moment a stranger can write in private that reasoning is false,
+    and /backup would hand the whole database to whoever asked. Each of those
+    commands therefore checks is_admin itself and stays silent for anyone else.
     """
     @wraps(handler)
     async def guarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat
         if chat and chat.type == ChatType.PRIVATE:
-            if is_admin(update):
-                return await handler(update, context)
-            logger.info("Ignoring private chat from non-admin %s",
-                        update.effective_user.id if update.effective_user else None)
-            return
+            return await handler(update, context)
         if not chat or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
             logger.info("Ignoring update from chat type %s",
                         chat.type if chat else None)
