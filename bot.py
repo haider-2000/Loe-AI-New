@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, User
 from telegram.constants import ChatType
 from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
@@ -65,6 +65,24 @@ UNSUPPORTED_DOCUMENT_MESSAGE = (
 WAKE_UP_MESSAGE = ("هلا بيك! شنو السؤال؟ دزه نصاً، أو صورة، أو صوت، "
                    "وأنا جاوبك.")
 
+# Private chat is open to anybody now, so the bot asks before it starts talking.
+# Telegram already blocks a bot from writing to someone who never spoke to it,
+# but that only asks for a tap on Start. This asks for a decision instead, and
+# the answer is kept, so the question is not repeated on every message.
+CONSENT_REQUEST = (
+    "طلب تأكيد\n\n"
+    "هسة أنت المشرف على هالمحادثة الخاصة بيني وبينك.\n"
+    "إذا توافق، أگدر نكمل دردشة وياك، وتگدر ترسل لي نص أو صورة أو صوت أو ملف.\n"
+    "إذا ما توافق، اضغط إلغاء وما راح أگدر أفتح لك الدردشة.")
+CONSENT_ACCEPTED = "تم التأكيد ✅\nالحين أنت مشرف هالمحادثة الخاصة. دز سؤالك وياي."
+CONSENT_DECLINED = "تم الإلغاء. وقت ما تريد تسأل، أرسل /start."
+CONSENT_NOT_YOURS = "هذا الطلب مو إلك."
+CONSENT_YES = "privok"
+CONSENT_NO = "privno"
+# Stored per user id next to the request text, so the flag name and the prompts
+# that depend on it move together.
+PRIVATE_CONSENT_FLAG = "pchat"
+
 # Whether the *database* lives somewhere ephemeral, like a Render container.
 # The name matters: it says nothing about the image bytes. A local disk already
 # keeps the file, so the bytes only need a second home inside the database when
@@ -100,13 +118,69 @@ def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == settings.admin_id)
 
 
+def _consent_flag(user_id: int) -> str:
+    return f"{PRIVATE_CONSENT_FLAG}:{user_id}"
+
+
+async def has_private_consent(user_id: int) -> bool:
+    """Whether this person already said yes to a private conversation.
+
+    The answer lives in the database rather than in memory: a restart on Render
+    must not make the bot ask a student the same question all over again.
+    """
+    return await read_flag(settings.database_path, _consent_flag(user_id)) == "1"
+
+
+async def set_private_consent(user_id: int, accepted: bool) -> None:
+    # A refused chat is stored as "0" rather than deleted, so "declined" and
+    # "never asked" stay apart, and /revoke needs no second code path.
+    await write_flag(settings.database_path, _consent_flag(user_id),
+                     "1" if accepted else "0")
+
+
+async def private_consent_keyboard(user: User) -> InlineKeyboardMarkup:
+    """The yes/no pair, with the id inside the callback data."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("تأكيد ✅", callback_data=f"{CONSENT_YES}:{user.id}"),
+        InlineKeyboardButton("إلغاء ✖️", callback_data=f"{CONSENT_NO}:{user.id}"),
+    ]])
+
+
+async def ask_private_consent(update: Update) -> None:
+    user = update.effective_user
+    if not user or not update.effective_message:
+        return
+    await update.effective_message.reply_text(
+        CONSENT_REQUEST, reply_markup=await private_consent_keyboard(user))
+
+
+def admin_only(handler):
+    """Stay silent for anybody but the owner.
+
+    Applied as the *outer* decorator on purpose. The chat gate below asks a
+    stranger in private for confirmation before it runs anything, and a command
+    this person could never use should not even be worth confirming: /backup has
+    to answer silence, because a confirmation prompt would only teach a stranger
+    that the command exists. Outermost, this check therefore runs first.
+    """
+    @wraps(handler)
+    async def guarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_admin(update):
+            return
+        return await handler(update, context)
+
+    return guarded
+
+
 def allowed_chat_only(handler):
     """Serve every group the bot is a member of, and every private chat.
 
     There is no group allowlist any more: any group or supergroup that adds the
     bot gets an answer, so a new class does not need a deployment first. Private
     chats are open to anyone as well, so a student can ask in direct messages
-    instead of hunting for the group first.
+    instead of hunting for the group first -- but only after they confirm they
+    want the conversation, which is what ask_private_consent is for. The owner is
+    never asked; they own the bot.
 
     The private commands that touch stored data -- /backup, /export, /approve and
     the rest of the teacher's tools -- are *not* protected by that. They used to
@@ -114,12 +188,16 @@ def allowed_chat_only(handler):
     definition, so "is this a private chat" was standing in for "is this the
     admin". The moment a stranger can write in private that reasoning is false,
     and /backup would hand the whole database to whoever asked. Each of those
-    commands therefore checks is_admin itself and stays silent for anyone else.
+    commands therefore carries admin_only, which runs before this gate.
     """
     @wraps(handler)
     async def guarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat
         if chat and chat.type == ChatType.PRIVATE:
+            user = update.effective_user
+            if user and not is_admin(update) and not await has_private_consent(user.id):
+                await ask_private_consent(update)
+                return
             return await handler(update, context)
         if not chat or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
             logger.info("Ignoring update from chat type %s",
@@ -497,10 +575,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(f"الخدمة تعمل. حالات البيانات: {summary}{reach}")
 
 
+@admin_only
 @allowed_chat_only
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        return
     counts = await count_by_status(settings.database_path)
     await update.effective_message.reply_text("إحصاءات داخلية: " + (", ".join(f"{k}: {v}" for k, v in counts.items()) or "فارغة"))
 
@@ -515,10 +592,9 @@ async def lessons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("الحصص المتاحة:\n" + "\n".join(lines))
 
 
+@admin_only
 @allowed_chat_only
 async def newlesson(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        return
     parts = (update.effective_message.text or "").split(" ", 1)
     values = [part.strip() for part in parts[1].split("|")] if len(parts) == 2 else []
     if len(values) not in {3, 4}:
@@ -533,10 +609,9 @@ async def newlesson(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("ما كدرت أضيف الحصة. تأكد من الصيغة وأن السعة بين 1 و50.")
 
 
+@admin_only
 @allowed_chat_only
 async def addstudent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        return
     text = update.effective_message.text or ""
     command, separator, code = text.partition("|")
     raw_id = command.replace("/addstudent", "", 1).strip()
@@ -547,10 +622,9 @@ async def addstudent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.effective_message.reply_text(message)
 
 
+@admin_only
 @allowed_chat_only
 async def roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        return
     raw = (update.effective_message.text or "").split(maxsplit=1)
     if len(raw) != 2 or not raw[1].isdigit():
         await update.effective_message.reply_text("الصيغة: /roster رقم_الحصة")
@@ -564,10 +638,9 @@ async def roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(f"حضور الحصة #{row['id']} — {row['title']} ({len(students)}/{row['capacity']}):\n{listing}")
 
 
+@admin_only
 @allowed_chat_only
 async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        return
     rows = await pending_rows(settings.database_path)
     if not rows:
         await update.effective_message.reply_text("ماكو عناصر بانتظار المراجعة.")
@@ -577,6 +650,7 @@ async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("العناصر غير المعتمدة:\n" + "\n".join(lines))
 
 
+@admin_only
 @allowed_chat_only
 @private_only
 async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -585,8 +659,6 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     Private chat only, so a decision about what leaves the dataset is never
     taken in front of the class that sent it in.
     """
-    if not is_admin(update):
-        return
     message = update.effective_message
     parts = (update.effective_message.text or "").split()
     if len(parts) != 3 or parts[2] not in {"approved", "rejected", "review"}:
@@ -626,11 +698,10 @@ def _status_summary(counts: dict[str, int]) -> str:
     return ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) or "فارغة"
 
 
+@admin_only
 @allowed_chat_only
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send the dataset as JSONL. `all` includes unreviewed and flagged rows."""
-    if not is_admin(update):
-        return
     message = update.effective_message
     everything = "all" in (update.effective_message.text or "").split()
     if everything and message.chat.type != ChatType.PRIVATE:
@@ -689,6 +760,59 @@ def drop_archive(archive: Path) -> None:
             shutil.rmtree(leftover, ignore_errors=True)
 
 
+async def private_consent_answered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Record the answer to the confirmation request and act on it.
+
+    The id travels inside the callback data rather than being read off the chat,
+    so a tap cannot confirm on somebody else's behalf, and the presser still has
+    to be the person the request was addressed to.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    decision, _, raw_id = (query.data or "").partition(":")
+    try:
+        asked_user = int(raw_id)
+    except ValueError:
+        await query.answer(CONSENT_NOT_YOURS, show_alert=True)
+        return
+    if not query.from_user or query.from_user.id != asked_user:
+        await query.answer(CONSENT_NOT_YOURS, show_alert=True)
+        return
+    if decision == CONSENT_YES:
+        await set_private_consent(asked_user, True)
+        await query.answer("تم التأكيد ✅")
+        await query.edit_message_text(CONSENT_ACCEPTED)
+    else:
+        await set_private_consent(asked_user, False)
+        await query.answer("تم الإلغاء")
+        await query.edit_message_text(CONSENT_DECLINED)
+
+
+async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Take back a private confirmation, so the bot asks that person again.
+
+    Without this one mistaken tap on تأكيد would be permanent, and the owner
+    would have no way to close a private chat they did not want open.
+    """
+    if not is_admin(update):
+        return
+    message = update.effective_message
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+        await message.reply_text("الصيغة: /revoke رقم_المستخدم")
+        return
+    target = int(parts[1])
+    if target == settings.admin_id:
+        await message.reply_text("هذا أنت، وما تحتاج.")
+        return
+    await set_private_consent(target, False)
+    logger.info("Owner revoked the private confirmation of user %s", target)
+    await message.reply_text(
+        f"رفت التأكيد عن {target}. أول ما يرسل /start راح ينطلب تأكيد جديد.")
+
+
+@admin_only
 @allowed_chat_only
 @private_only
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -696,8 +820,6 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     Private chat only, so the archive never lands in front of the whole group.
     """
-    if not is_admin(update):
-        return
     message = update.effective_message
     await message.reply_text("جاري تجهيز النسخة الاحتياطية...")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1161,8 +1283,9 @@ async def quiz_topic_picked(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     await query.answer()
     message = query.message
-    if message.chat.type == ChatType.PRIVATE and not is_admin(update):
-        return
+    # No admin check here: the buttons belong to the person who ran /quiz, and
+    # private is open to any confirmed student. allowed_chat_only has already
+    # settled who is allowed to be talking to the bot at all.
     try:
         index = int(query.data.split(":", 1)[1])
         _label, topic = QUIZ_TOPICS[index]
@@ -1352,12 +1475,15 @@ def main() -> None:
     application.add_handler(CommandHandler("approve", approve))
     application.add_handler(CommandHandler("backup", backup))
     application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("revoke", revoke))
     application.add_handler(CommandHandler("forget", forget))
     application.add_handler(CommandHandler("pause", pause))
     application.add_handler(CommandHandler("quiz", quiz))
     application.add_handler(CommandHandler("progress", progress))
     application.add_handler(CallbackQueryHandler(quiz_topic_picked, pattern=r"^qtopic:"))
     application.add_handler(CallbackQueryHandler(quiz_answered, pattern=r"^qa:"))
+    application.add_handler(CallbackQueryHandler(private_consent_answered,
+                                                 pattern=r"^priv(?:ok|no):\d+$"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
