@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import uuid
 from datetime import datetime
 from functools import wraps
@@ -433,22 +434,79 @@ async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE
         getattr(update, "update_id", None), kind,
         getattr(chat, "id", None), getattr(chat, "type", None), len(text),
         "yes" if getattr(message, "reply_to_message", None) else "no")
+    if chat is not None and chat.type != ChatType.PRIVATE:
+        # Cheap here, writes at most once a minute: the counters /status shows
+        # when a group goes quiet.
+        await flush_routing(chat.id)
 
 
-def directed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Whether this message is the bot being spoken to, and why.
+ROUTING_FLAG = "routing"
+# What each chat actually sends us, kept in memory and flushed to the database
+# at most once a minute. A group going quiet is the hardest thing in this bot to
+# diagnose, because the only other place the answer lives is a Render log that
+# nobody has open. Counting the decisions here lets /status report them in
+# Telegram, which is the difference between a five second check and an hour of
+# guessing. No text is kept, only which branch answered.
+_ROUTING_NOTES: dict[int, dict[str, Any]] = {}
+_ROUTING_WRITTEN: dict[int, float] = {}
+ROUTING_FLUSH_SECONDS = 60.0
 
-    In a group there are three ways in, and they are checked in the order a
-    student is most likely to use them. Every decision is logged with the chat
-    and the reason but never the text: a group going quiet produces no visible
-    trace at all, so the log is the only place left to look, and a student's
-    question has no business being written to disk just to explain routing.
+
+def note_routing(chat_id: int, reason: str) -> None:
+    note = _ROUTING_NOTES.setdefault(
+        chat_id, {"seen": 0, "name": 0, "mention": 0, "reply": 0, "no": 0,
+                  "last": None, "at": 0})
+    note["seen"] += 1
+    if reason in note:
+        note[reason] += 1
+    note["last"] = reason
+    note["at"] = int(time.time())
+
+
+async def flush_routing(chat_id: int) -> None:
+    """Persist the note, at most once a minute, and never at the cost of a reply.
+
+    Every message would otherwise become a write to the database, and the
+    counter only exists for a human to read later, so it waits its turn. A
+    failure to record it is not worth surfacing to a student.
+    """
+    note = _ROUTING_NOTES.get(chat_id)
+    if not note:
+        return
+    now = time.time()
+    if now - _ROUTING_WRITTEN.get(chat_id, 0.0) < ROUTING_FLUSH_SECONDS:
+        return
+    _ROUTING_WRITTEN[chat_id] = now
+    try:
+        await write_flag(settings.database_path, f"{ROUTING_FLAG}:{chat_id}",
+                         json.dumps(note, ensure_ascii=False))
+    except Exception:
+        logger.debug("Could not record the routing note", exc_info=True)
+
+
+async def read_routing(chat_id: int) -> dict[str, Any] | None:
+    raw = await read_flag(settings.database_path, f"{ROUTING_FLAG}:{chat_id}")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+def routing_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Which of the four ways in this message used, as a name we can count.
+
+    "private" is the fourth: a direct message is always for the bot. The name
+    matters as much as the answer, because "no" is the only one that means the
+    message arrived and was still ignored, which is the whole puzzle when a
+    group stops answering.
     """
     message = update.effective_message
     if not message:
-        return False
+        return "no"
     if message.chat.type == ChatType.PRIVATE:
-        return True
+        return "private"
     bot_username = context.bot.username or ""
     mention = f"@{bot_username.lower()}" if bot_username else ""
     text = message.text or message.caption or ""
@@ -466,6 +524,22 @@ def directed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         getattr(message.chat, "title", None) or message.chat.id,
         getattr(message, "message_id", None), len(text),
         bot_username or "(none)", reason)
+    return reason
+
+
+def directed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Whether this message is the bot being spoken to.
+
+    In a group there are three ways in, checked in the order a student is most
+    likely to use them: the @handle, the bare name, or a reply to the bot. The
+    decision is logged with the chat and the reason but never the text, since a
+    group going quiet leaves no other trace and a student's question has no
+    business being written to disk just to explain routing.
+    """
+    reason = routing_reason(update, context)
+    chat = getattr(update, "effective_chat", None)
+    if reason != "private" and chat is not None:
+        note_routing(chat.id, reason)
     return reason != "no"
 
 
@@ -652,8 +726,20 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     where = ""
     if chat.type != ChatType.PRIVATE:
-        where = (f"🧭 هالمحادثة: {getattr(chat, 'title', None) or chat.id} "
-                 f"— المعرّف: {chat.id}\n")
+        note = await read_routing(chat.id)
+        if note:
+            # The one line that says which of the four ways in this group has
+            # been used. "وصلت: 0" means Telegram is not delivering anything,
+            # which no amount of code reading can reveal.
+            where = (f"🧭 هالمحادثة: {getattr(chat, 'title', None) or chat.id} "
+                     f"— المعرّف: {chat.id}\n"
+                     f"📊 وصلني: {note.get('seen', 0)} رسالة · "
+                     f"اسم: {note.get('name', 0)} · منشن: {note.get('mention', 0)} · "
+                     f"رد: {note.get('reply', 0)} · متجاهلة: {note.get('no', 0)}\n")
+        else:
+            where = (f"🧭 هالمحادثة: {getattr(chat, 'title', None) or chat.id} "
+                     f"— المعرّف: {chat.id}\n"
+                     f"📊 ما وصلني أي نص عادي بهالمحادثة بعد.\n")
     await update.effective_message.reply_text(
         f"{where}الخدمة تعمل. حالات البيانات: {summary}{reach}")
 
@@ -1571,9 +1657,12 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(quiz_answered, pattern=r"^qa:"))
     application.add_handler(CallbackQueryHandler(private_consent_answered,
                                                  pattern=r"^priv(?:ok|no):\d+$"))
-    # First, and with block=False: it only watches, so a message no other
-    # handler wants is still visible in the log instead of vanishing.
-    application.add_handler(TypeHandler(Update, log_arriving_update, block=False))
+    # Group -1 so it runs before every other handler: registered in the same
+    # group, the text handler would always match first and the watcher would
+    # never see the update it exists to witness. block=False keeps it from
+    # taking the update away from whoever is meant to answer.
+    application.add_handler(TypeHandler(Update, log_arriving_update, block=False),
+                            group=-1)
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
