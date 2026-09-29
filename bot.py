@@ -463,7 +463,7 @@ def note_routing(chat_id: int, reason: str) -> None:
     note["at"] = int(time.time())
 
 
-async def flush_routing(chat_id: int) -> None:
+async def flush_routing(chat_id: int, force: bool = False) -> None:
     """Persist the note, at most once a minute, and never at the cost of a reply.
 
     Every message would otherwise become a write to the database, and the
@@ -474,7 +474,7 @@ async def flush_routing(chat_id: int) -> None:
     if not note:
         return
     now = time.time()
-    if now - _ROUTING_WRITTEN.get(chat_id, 0.0) < ROUTING_FLUSH_SECONDS:
+    if not force and now - _ROUTING_WRITTEN.get(chat_id, 0.0) < ROUTING_FLUSH_SECONDS:
         return
     _ROUTING_WRITTEN[chat_id] = now
     try:
@@ -482,6 +482,34 @@ async def flush_routing(chat_id: int) -> None:
                          json.dumps(note, ensure_ascii=False))
     except Exception:
         logger.debug("Could not record the routing note", exc_info=True)
+
+
+async def flush_all_routing() -> None:
+    """Write every chat's tally, on a timer, so the last word is never lost.
+
+    The watcher flushes on the way in, but it runs before the handlers, so the
+    most recent message of a quiet group would sit in memory forever. A group
+    that says one thing and then goes silent is exactly the one whose count
+    matters, so the tail is written here whether or not more traffic arrives.
+    """
+    for chat_id in list(_ROUTING_NOTES):
+        await flush_routing(chat_id, force=True)
+
+
+async def routing_flush_loop() -> None:
+    """Keep the tallies current for as long as the bot runs.
+
+    Not the job queue: that needs APScheduler, which is not a dependency here,
+    and the codebase already runs its other periodic work as a plain task.
+    """
+    while True:
+        await asyncio.sleep(ROUTING_FLUSH_SECONDS)
+        try:
+            await flush_all_routing()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Could not write the routing tallies", exc_info=True)
 
 
 async def read_routing(chat_id: int) -> dict[str, Any] | None:
@@ -1663,6 +1691,10 @@ def main() -> None:
     # taking the update away from whoever is meant to answer.
     application.add_handler(TypeHandler(Update, log_arriving_update, block=False),
                             group=-1)
+    # A group that goes quiet after its last message is the one whose tally we
+    # most need, so the counters are written on a timer and not only when the
+    # next message happens to arrive.
+    application.create_task(routing_flush_loop())
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
