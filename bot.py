@@ -226,6 +226,22 @@ async def reply_answer(message, text: str) -> None:
 # a fast typist would all slip past and the bot would ignore its own name.
 _NAME_WORDS = ("leo", "ليو")
 _DIACRITIC_RANGES = ((0x064B, 0x0652), (0x0670, 0x0670), (0x06D6, 0x06ED))
+# Marks that carry no letter of their own. A harakat decorates a letter, but a
+# tatweel or a zero-width joiner sits *between* two letters and is dropped by
+# plenty of phone keyboards and by copy-paste from a web page. Leaving them in
+# turns "ليو" into something the pattern below does not recognise, and the bot
+# then ignores a student writing its own name.
+_IGNORED_CHARS = (
+    {chr(code) for low, high in _DIACRITIC_RANGES for code in range(low, high + 1)}
+    | set("\u0640"          # tatweel, typed as a straight line
+          "\u200b"          # zero width space
+          "\u200c"          # zero width non-joiner
+          "\u200d"          # zero width joiner
+          "\u200e\u200f"    # left-to-right / right-to-left marks
+          "\u061c"          # Arabic letter mark
+          "\u2060"          # word joiner
+          "\ufeff")         # byte order mark
+)
 # Spellings that mean the same letter to a reader but not to a regex. Arabic
 # keyboards disagree about yeh, and plenty of phones emit the Persian one.
 _LETTER_FOLD = {
@@ -243,24 +259,31 @@ _NAME_RE = re.compile(
     r"(?<!\w)(?:leo|لي[وؤ][وؤ]?)(?!\w)", re.IGNORECASE)
 
 
-def _fold(text: str) -> str:
-    """Strip diacritics and unify letter variants for matching.
+def _fold(text: str) -> tuple[str, list[int]]:
+    """Fold the text into a matchable form and keep a map back to the original.
 
-    Length is preserved, one character in and one out, so a name matched here
-    can be cut out of the original text and leave the student's own spelling
-    of the rest of the message untouched.
+    The ignored marks are dropped so a name split by one of them still matches,
+    and dropping them also shortens the string, so the offset of every surviving
+    character is recorded. Slicing the original with a folded offset would cut
+    the wrong characters: in "مَرْحَبًا ليو" the two marks before the name are
+    gone, the match lands two places early, and the name is left in the question
+    while the greeting loses its last two letters.
     """
-    out = []
-    for ch in text:
-        if any(low <= ord(ch) <= high for low, high in _DIACRITIC_RANGES):
+    folded: list[str] = []
+    origin: list[int] = []
+    for index, ch in enumerate(text):
+        if ch in _IGNORED_CHARS:
             continue
-        out.append(_LETTER_FOLD.get(ch, ch))
-    return "".join(out)
+        folded.append(_LETTER_FOLD.get(ch, ch))
+        origin.append(index)
+    return "".join(folded), origin
 
 
 def _name_spans(text: str) -> list[tuple[int, int]]:
-    """Where the bot's name appears, found in the folded text."""
-    return [match.span() for match in _NAME_RE.finditer(_fold(text))]
+    """Where the bot's name appears, as offsets into the original text."""
+    folded, origin = _fold(text)
+    return [(origin[match.start()], origin[match.end() - 1] + 1)
+            for match in _NAME_RE.finditer(folded)]
 
 
 def is_name_call(text: str) -> bool:
@@ -270,7 +293,7 @@ def is_name_call(text: str) -> bool:
     "leo" or "ليو" is enough. Word boundaries matter: without them every
     message mentioning paleontology or Cleopatra would wake the bot.
     """
-    return bool(_NAME_RE.search(_fold(text)))
+    return bool(_name_spans(text))
 
 
 def directed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
