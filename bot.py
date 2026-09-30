@@ -299,20 +299,45 @@ async def thinking_pause(message) -> None:
         remaining -= step
 
 
+def note_outcome(chat_id: int | None, sent: bool, error: str = "") -> None:
+    """Record whether a reply actually left the bot, and if not, why.
+
+    The routing counters say the bot decided to answer. Nothing said whether
+    the answer ever reached Telegram, and that is the one step left unobserved:
+    a bot that decides to answer and then dies in the middle of its handler
+    looks from the outside exactly like a bot that was never asked.
+    """
+    if chat_id is None:
+        return
+    note = _ROUTING_NOTES.get(chat_id)
+    if not note:
+        return
+    if sent:
+        note["sent"] = note.get("sent", 0) + 1
+        note["failed"] = 0
+    else:
+        note["failed"] = note.get("failed", 0) + 1
+        note["err"] = error[:200] or None
+    note["at"] = int(time.time())
+
+
 async def reply_answer(message, text: str) -> None:
     """Send an answer, splitting it if it exceeds what Telegram accepts.
 
     A busy group can trip Telegram's per-group flood limit, which would silently
     drop the reply, so RetryAfter is honoured instead of being swallowed.
     """
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
     for chunk in _chunks(text):
         for attempt in range(3):
             try:
                 await message.reply_text(chunk)
+                note_outcome(chat_id, True)
                 break
             except RetryAfter as exc:
                 if attempt == 2:
                     logger.error("Gave up sending after repeated rate limits")
+                    note_outcome(chat_id, False, "rate limited by Telegram")
                     return
                 wait = min(float(exc.retry_after or 1), 30.0)
                 logger.warning("Telegram rate limit, waiting %.1fs before retrying", wait)
@@ -763,7 +788,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                      f"— المعرّف: {chat.id}\n"
                      f"📊 وصلني: {note.get('seen', 0)} رسالة · "
                      f"اسم: {note.get('name', 0)} · منشن: {note.get('mention', 0)} · "
-                     f"رد: {note.get('reply', 0)} · متجاهلة: {note.get('no', 0)}\n")
+                     f"رد: {note.get('reply', 0)} · متجاهلة: {note.get('no', 0)}\n"
+                     f"📤 ردت: {note.get('sent', 0)} · فشل: {note.get('failed', 0)}\n"
+                     + (f"⚠️ آخر خطأ: {note['err']}\n" if note.get("err") else ""))
         else:
             where = (f"🧭 هالمحادثة: {getattr(chat, 'title', None) or chat.id} "
                      f"— المعرّف: {chat.id}\n"
@@ -1109,6 +1136,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not directed_to_bot(update, context):
         return
     message = update.effective_message
+    chat_id = update.effective_chat.id
     raw = message.text or ""
     text = clean_prompt(raw, context.bot.username or "")
     if not text:
@@ -1119,7 +1147,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # check is what used to leave a bare "@handle" in silence, because a
         # handle is not the word "ليو" and never matched the name pattern.
         if raw.strip():
-            await message.reply_text(WAKE_UP_MESSAGE)
+            await reply_answer(message, WAKE_UP_MESSAGE)
         return
     key = thread_key(update)
     try:
@@ -1132,12 +1160,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await reply_answer(message, answer)
     except GeminiQuotaError:
         logger.error("No quota for any model; the account needs billing")
+        note_outcome(chat_id, False, "no Gemini quota")
         await message.reply_text(QUOTA_MESSAGE)
     except GeminiUnavailableError:
         logger.warning("All Gemini models are busy; answering %s later", settings.gemini_model)
+        note_outcome(chat_id, False, "every model busy")
         await message.reply_text(BUSY_MESSAGE)
-    except Exception:
+    except Exception as exc:
         logger.exception("Text processing failed")
+        note_outcome(chat_id, False, f"{type(exc).__name__}: {exc}")
         await message.reply_text("صار خلل مؤقت بالخدمة. حاول بعد شوي.")
 
 
