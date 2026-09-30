@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, User
 from telegram.constants import ChatType
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import Conflict, RetryAfter, TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, TypeHandler, filters)
 
@@ -1885,11 +1885,7 @@ async def post_init(application: Application) -> None:
         logger.info("Automatic backup every %d minute(s) to the admin's private chat", minutes)
 
 
-def main() -> None:
-    global settings, ai, health_port
-    settings = Settings.from_env()
-    ai = GeminiClient(settings.gemini_api_key, settings.gemini_model)
-    health_port = start_health_server()
+def build_application() -> Application:
     application = (Application.builder()
                    .token(settings.telegram_bot_token)
                    .concurrent_updates(True)
@@ -1931,8 +1927,55 @@ def main() -> None:
     # A handler that falls over leaves no trace the person waiting for an answer
     # can see, and the one place they can see anything is this chat's own note.
     application.add_error_handler(note_handler_failure)
+    return application
+
+
+# How long to wait before starting over after the polling loop gives up.
+RESTART_AFTER_SECONDS = 5.0
+
+
+def main() -> None:
+    """Keep the bot polling, whatever the reason it stopped.
+
+    Losing the right to poll is not a reason to quit. Telegram gives the token
+    to exactly one poller at a time, and any overlap produces a Conflict --
+    which is what a deploy does by itself, since the new instance starts before
+    the old one has let go. PTB's default gives that conflict zero retries and
+    re-raises it, so the process stopped and Render started it again, into the
+    same conflict: a deploy turned the bot off. The group then looks exactly
+    like a group the bot stopped listening to, which is the wrong conclusion to
+    reach and an hour of guessing.
+
+    So polling is retried forever rather than allowed to end, and the run is
+    rebuilt from scratch each time because a stopped application cannot be
+    started again.
+    """
+    global settings, ai, health_port
+    settings = Settings.from_env()
+    ai = GeminiClient(settings.gemini_api_key, settings.gemini_model)
+    health_port = start_health_server()
     logger.info("Leo starting with model %s", settings.gemini_model)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    attempt = 0
+    while True:
+        application = build_application()
+        try:
+            # bootstrap_retries=-1 means retry every network error, forever,
+            # instead of the first one ending the process.
+            application.run_polling(allowed_updates=Update.ALL_TYPES,
+                                    bootstrap_retries=-1)
+            return
+        except Conflict:
+            attempt += 1
+            logger.warning(
+                "Another instance holds the token (attempt %d); waiting %.0fs. "
+                "If this repeats, another service is polling this bot.",
+                attempt, RESTART_AFTER_SECONDS)
+        except Exception:
+            attempt += 1
+            logger.exception("Polling stopped (attempt %d); waiting %.0fs",
+                             attempt, RESTART_AFTER_SECONDS)
+        time.sleep(RESTART_AFTER_SECONDS)
+
 
 if __name__ == "__main__":
     main()
