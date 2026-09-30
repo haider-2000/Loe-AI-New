@@ -538,13 +538,19 @@ async def routing_flush_loop() -> None:
 
 
 async def read_routing(chat_id: int) -> dict[str, Any] | None:
-    raw = await read_flag(settings.database_path, f"{ROUTING_FLAG}:{chat_id}")
-    if not raw:
+    """This run's tally for a chat, written out on the way so it survives a crash.
+
+    Only the running process's own counts are reported. The database also
+    holds the tally of whichever run wrote last, and after a restart that is a
+    dead one: /status quoted 16 messages for a group the live bot had never
+    seen a message in, which is not a small detail to get wrong when the whole
+    question is whether messages are arriving.
+    """
+    note = _ROUTING_NOTES.get(chat_id)
+    if not note:
         return None
-    try:
-        return json.loads(raw)
-    except ValueError:
-        return None
+    await flush_routing(chat_id, force=True)
+    return note
 
 
 def routing_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -782,7 +788,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         note = await read_routing(chat.id)
         if note:
             # The one line that says which of the four ways in this group has
-            # been used. "وصلت: 0" means Telegram is not delivering anything,
+            # been used. "وصلني: 0" means Telegram is not delivering anything,
             # which no amount of code reading can reveal.
             where = (f"🧭 هالمحادثة: {getattr(chat, 'title', None) or chat.id} "
                      f"— المعرّف: {chat.id}\n"
