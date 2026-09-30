@@ -1675,6 +1675,16 @@ async def post_init(application: Application) -> None:
     )
     if application is not None:
         await check_group_privacy_mode(application.bot)
+        # The flush is scheduled here and not in main(): a task can only be
+        # created once the loop is running, and main() runs before that.
+        # Scheduling it from main() raised "no running event loop" and killed
+        # the bot at startup, which is the one failure that looks exactly like
+        # a bot that has gone quiet in a group.
+        #
+        # A group that goes quiet after its last message is the one whose tally
+        # we most need, so the counters are written on a timer and not only
+        # when the next message happens to arrive.
+        application.create_task(routing_flush_loop())
     if health_port:
         application.create_task(keep_awake(health_port))
     minutes = int(os.getenv("AUTO_BACKUP_MINUTES", "0") or 0)
@@ -1722,10 +1732,6 @@ def main() -> None:
     # taking the update away from whoever is meant to answer.
     application.add_handler(TypeHandler(Update, log_arriving_update, block=False),
                             group=-1)
-    # A group that goes quiet after its last message is the one whose tally we
-    # most need, so the counters are written on a timer and not only when the
-    # next message happens to arrive.
-    application.create_task(routing_flush_loop())
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
