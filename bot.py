@@ -420,6 +420,17 @@ def is_name_call(text: str) -> bool:
     return bool(_name_spans(text))
 
 
+def is_command(message: Any) -> bool:
+    """Whether this message is a slash command.
+
+    PTB's own filter for this reads the message entities. Reusing the same test
+    here means the watcher and the handlers agree on what a command is, instead
+    of the watcher inventing a category the handlers never treat as one.
+    """
+    entities = getattr(message, "entities", None) or ()
+    return any(getattr(entity, "type", None) == "bot_command" for entity in entities)
+
+
 async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Record that an update arrived at all, whatever it turned out to be.
 
@@ -460,10 +471,17 @@ async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE
         getattr(chat, "id", None), getattr(chat, "type", None), len(text),
         "yes" if getattr(message, "reply_to_message", None) else "no")
     if chat is not None and chat.type != ChatType.PRIVATE:
-        # Cheap here, writes at most once a minute: the counters /status shows
-        # when a group goes quiet. What gets recorded is the shape, decided by
-        # what the message carries rather than by which handler claimed it, so a
-        # message nobody handles is still visible in /status.
+        # What gets recorded is the shape, decided by what the message carries
+        # rather than by which handler claimed it, so a message nobody handles
+        # is still visible in /status.
+        #
+        # Nothing is awaited here, and that is the whole point. This watcher is
+        # on the path of every single update, ahead of the handler that is meant
+        # to answer the student, and updates are processed one after another. A
+        # remote write costs about a second, and the client has no timeout, so a
+        # slow moment used to hold every later message hostage behind it -- one
+        # image was counted here and then never reached the handler, because the
+        # write stalled in between. The timer writes the note instead.
         if kind != "message":
             shape = kind
         elif getattr(message, "photo", None) is not None:
@@ -482,9 +500,12 @@ async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE
             shape = "نص"
         else:
             shape = "شي"
-        note_arrival(chat.id, shape, len(text),
-                     bool(getattr(message, "reply_to_message", None)))
-        await flush_routing(chat.id)
+        # A command is handled by a command handler, which never asks for a
+        # routing decision, so counting it would invent an arrival that reached
+        # no handler -- a fault that does not exist, reported next to real ones.
+        if not is_command(message):
+            note_arrival(chat.id, shape, len(text),
+                         bool(getattr(message, "reply_to_message", None)))
 
 
 ROUTING_FLAG = "routing"
@@ -552,6 +573,39 @@ def note_routing(chat_id: int, reason: str) -> None:
         note[reason] += 1
     note["last"] = reason
     note["at"] = int(time.time())
+
+
+def note_fault(chat_id: int, where: str, exc: BaseException) -> None:
+    """Remember a failure in the machinery itself, so /status can show it.
+
+    Every fault so far in this bot has been visible only in a Render log that
+    nobody had open at the time: a handler that raised, a database that would
+    not answer, a message that reached nothing. Each of those looks identical
+    from inside Telegram, which is silence. This is the one place the reason is
+    written where the person waiting for an answer will actually read it.
+    """
+    note = _routing_note(chat_id)
+    note["err"] = f"{where}: {type(exc).__name__}: {exc}"
+    note["at"] = int(time.time())
+
+
+def note_pause_read_failed(chat_id: int) -> None:
+    note = _routing_note(chat_id)
+    note["pause_db"] = "ما قدرت أقرا علم الإيقاف"
+    note["at"] = int(time.time())
+
+
+async def note_handler_failure(update: object, error: BaseException) -> None:
+    """Write the reason a handler fell over into the chat's own note.
+
+    PTB logs this and moves on, which leaves the student with no answer and the
+    bot's owner with a log line they have to know to go looking for. The chat id
+    is all it takes to put the reason in front of them instead.
+    """
+    chat = getattr(update, "effective_chat", None)
+    if chat is not None and chat.type != ChatType.PRIVATE:
+        note_fault(chat.id, "معالج", error)
+    logger.exception("Handler failed", exc_info=error)
 
 
 async def flush_routing(chat_id: int, force: bool = False) -> None:
@@ -714,8 +768,20 @@ def _pause_flag(chat_id: int) -> str:
 
 async def is_paused(chat_id: int) -> bool:
     if chat_id not in _paused:
-        _paused[chat_id] = (await read_flag(settings.database_path,
-                                           _pause_flag(chat_id))) == "1"
+        try:
+            _paused[chat_id] = (await read_flag(settings.database_path,
+                                               _pause_flag(chat_id))) == "1"
+        except Exception:
+            # This sits in front of every message handler, and the remote client
+            # has no timeout, so an unreachable database used to take the handler
+            # down with it: the update was counted by the watcher and then never
+            # answered, with nothing anywhere saying the database was the reason.
+            # A pause is a choice to be quiet, so when we cannot read the choice
+            # we answer instead -- a student gets a reply, and the outage shows
+            # in /status instead of as silence.
+            logger.exception("Could not read the pause flag for chat %s", chat_id)
+            _paused[chat_id] = False
+            note_pause_read_failed(chat_id)
     return _paused[chat_id]
 
 
@@ -874,6 +940,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                      + (f"🚶 {unhandled} وصلت وما وصلها هاندلر أصلاً\n" if unhandled else "")
                      + (f"📤 ردت: {note.get('sent', 0)} · فشل: {note.get('failed', 0)}\n"
                         if ("sent" in note or "failed" in note) else "")
+                     + (f"🗄️ {note['pause_db']}\n" if note.get("pause_db") else "")
                      + (f"⚠️ آخر خطأ: {note['err']}\n" if note.get("err") else ""))
             # The shapes of the last few arrivals settle the one question the
             # counters cannot: did the message arrive and get ignored, or did it
@@ -1830,6 +1897,9 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # A handler that falls over leaves no trace the person waiting for an answer
+    # can see, and the one place they can see anything is this chat's own note.
+    application.add_error_handler(note_handler_failure)
     logger.info("Leo starting with model %s", settings.gemini_model)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
