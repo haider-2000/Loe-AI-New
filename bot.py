@@ -534,6 +534,15 @@ def _routing_note(chat_id: int) -> dict[str, Any]:
                   "last": None, "at": 0, "recent": []})
 
 
+# Which of the four ways in this message used, in words a student can act on.
+_WHY_WORDS = {
+    "name": "✔️ عرفها: اسمك أولها",
+    "mention": "✔️ عرفها: منشنك",
+    "reply": "✔️ عرفها: رد على رسالتي",
+    "no": "🚫 ما عرفها — لازم اسمك أول الكابشن",
+}
+
+
 def describe_shape(kind: str, chars: int, is_reply: bool) -> str:
     """Say what a message looked like, in words, without quoting it.
 
@@ -572,6 +581,14 @@ def note_routing(chat_id: int, reason: str) -> None:
     if reason in note:
         note[reason] += 1
     note["last"] = reason
+    # The watcher runs immediately before the handler, so the arrival sitting at
+    # the end of the list is this message. Recording the verdict beside its shape
+    # is what turns "I got nothing" into "your caption had no name in it" -- the
+    # totals alone say only that something was ignored, not which of the five
+    # ways in it missed.
+    recent = note.get("recent") or []
+    if recent:
+        recent[-1]["why"] = reason
     note["at"] = int(time.time())
 
 
@@ -950,8 +967,16 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 lines = []
                 for entry in reversed(recent):
                     age = max(0, int(time.time()) - entry.get("at", 0))
-                    lines.append(f"   · {entry.get('shape', '؟')} — {age} ثانية")
+                    why = _WHY_WORDS.get(entry.get("why", ""), "")
+                    lines.append(f"   · {entry.get('shape', '؟')} — {age} ثانية"
+                                 + (f"\n     {why}" if why else ""))
                 where += ("🕒 آخر ما وصلني:\n" + "\n".join(lines) + "\n")
+                # When a picture is the way in, the caption is the only place the
+                # name can go, and a caption that misses it fails silently. Say
+                # how to reach the bot, in the same message that shows the miss.
+                if any(entry.get("why") == "no" for entry in recent):
+                    where += ("💡 بالصورة، اكتب `ليو` أول الكابشن لحالها، "
+                              "والسؤال بالكتابة أو بالصورة نفسها.\n")
         else:
             where = (f"🧭 هالمحادثة: {getattr(chat, 'title', None) or chat.id} "
                      f"— المعرّف: {chat.id}\n"
