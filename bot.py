@@ -461,7 +461,29 @@ async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE
         "yes" if getattr(message, "reply_to_message", None) else "no")
     if chat is not None and chat.type != ChatType.PRIVATE:
         # Cheap here, writes at most once a minute: the counters /status shows
-        # when a group goes quiet.
+        # when a group goes quiet. What gets recorded is the shape, decided by
+        # what the message carries rather than by which handler claimed it, so a
+        # message nobody handles is still visible in /status.
+        if kind != "message":
+            shape = kind
+        elif getattr(message, "photo", None) is not None:
+            shape = "صورة"
+        elif getattr(message, "voice", None) is not None:
+            shape = "صوت"
+        elif getattr(message, "audio", None) is not None:
+            shape = "صوت"
+        elif getattr(message, "video", None) is not None or getattr(message, "video_note", None) is not None:
+            shape = "فيديو"
+        elif getattr(message, "document", None) is not None:
+            shape = "ملف"
+        elif getattr(message, "sticker", None) is not None:
+            shape = "ملصق"
+        elif text:
+            shape = "نص"
+        else:
+            shape = "شي"
+        note_arrival(chat.id, shape, len(text),
+                     bool(getattr(message, "reply_to_message", None)))
         await flush_routing(chat.id)
 
 
@@ -475,12 +497,47 @@ ROUTING_FLAG = "routing"
 _ROUTING_NOTES: dict[int, dict[str, Any]] = {}
 _ROUTING_WRITTEN: dict[int, float] = {}
 ROUTING_FLUSH_SECONDS = 60.0
+ROUTING_RECENT = 5
+
+# Update kinds that arrive already in English; a message's own shape is named in
+# Arabic by the watcher and passes through untouched.
+_SHAPE_WORDS = {
+    "edited": "تعديل", "channel": "قناة", "service": "خدمة", "other": "شي",
+    "callback": "زر", "message": "رسالة",
+}
+
+
+def _routing_note(chat_id: int) -> dict[str, Any]:
+    return _ROUTING_NOTES.setdefault(
+        chat_id, {"seen": 0, "name": 0, "mention": 0, "reply": 0, "no": 0,
+                  "last": None, "at": 0, "recent": []})
+
+
+def describe_shape(kind: str, chars: int, is_reply: bool) -> str:
+    """Say what a message looked like, in words, without quoting it.
+
+    A person who sent "ليو سؤال" into a silent group needs to see whether the
+    message arrived at all. The counters alone cannot tell that apart from a
+    message that arrived and was not recognised: both read zero. So the shape is
+    reported instead -- a text of eight characters is unmistakable evidence that
+    the message arrived, and only the length is disclosed, never the words.
+    """
+    word = _SHAPE_WORDS.get(kind, kind)
+    text = f"{chars} حرف" if chars else "بدون نص"
+    return f"{word} · {text}" + (" · رد على رسالة" if is_reply else "")
+
+
+def note_arrival(chat_id: int, kind: str, chars: int, is_reply: bool) -> None:
+    """Keep the last few arrivals' shapes, for /status to show."""
+    note = _routing_note(chat_id)
+    note.setdefault("recent", []).append(
+        {"shape": describe_shape(kind, chars, is_reply), "at": int(time.time())})
+    del note["recent"][:-ROUTING_RECENT]
+    note["at"] = int(time.time())
 
 
 def note_routing(chat_id: int, reason: str) -> None:
-    note = _ROUTING_NOTES.setdefault(
-        chat_id, {"seen": 0, "name": 0, "mention": 0, "reply": 0, "no": 0,
-                  "last": None, "at": 0})
+    note = _routing_note(chat_id)
     note["seen"] += 1
     if reason in note:
         note[reason] += 1
@@ -797,6 +854,16 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                      f"رد: {note.get('reply', 0)} · متجاهلة: {note.get('no', 0)}\n"
                      f"📤 ردت: {note.get('sent', 0)} · فشل: {note.get('failed', 0)}\n"
                      + (f"⚠️ آخر خطأ: {note['err']}\n" if note.get("err") else ""))
+            # The shapes of the last few arrivals settle the one question the
+            # counters cannot: did the message arrive and get ignored, or did it
+            # never arrive at all.
+            recent = note.get("recent") or []
+            if recent:
+                lines = []
+                for entry in reversed(recent):
+                    age = max(0, int(time.time()) - entry.get("at", 0))
+                    lines.append(f"   · {entry.get('shape', '؟')} — {age} ثانية")
+                where += ("🕒 آخر ما وصلني:\n" + "\n".join(lines) + "\n")
         else:
             where = (f"🧭 هالمحادثة: {getattr(chat, 'title', None) or chat.id} "
                      f"— المعرّف: {chat.id}\n"
