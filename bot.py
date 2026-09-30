@@ -475,6 +475,12 @@ async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE
         # rather than by which handler claimed it, so a message nobody handles
         # is still visible in /status.
         #
+        # The media tests ask whether the field is present, not whether it is not
+        # None. Telegram leaves an absent list as an empty tuple, so "photo is
+        # not None" is true of every message that ever existed: plain text was
+        # reported as a picture, and three rounds of testing chased a photograph
+        # nobody had sent. What is absent is an empty collection.
+        #
         # Nothing is awaited here, and that is the whole point. This watcher is
         # on the path of every single update, ahead of the handler that is meant
         # to answer the student, and updates are processed one after another. A
@@ -484,13 +490,13 @@ async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE
         # write stalled in between. The timer writes the note instead.
         if kind != "message":
             shape = kind
-        elif getattr(message, "photo", None) is not None:
+        elif getattr(message, "photo", None):
             shape = "صورة"
         elif getattr(message, "voice", None) is not None:
             shape = "صوت"
         elif getattr(message, "audio", None) is not None:
             shape = "صوت"
-        elif getattr(message, "video", None) is not None or getattr(message, "video_note", None) is not None:
+        elif getattr(message, "video", None) or getattr(message, "video_note", None) is not None:
             shape = "فيديو"
         elif getattr(message, "document", None) is not None:
             shape = "ملف"
