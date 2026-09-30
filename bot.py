@@ -528,8 +528,18 @@ def describe_shape(kind: str, chars: int, is_reply: bool) -> str:
 
 
 def note_arrival(chat_id: int, kind: str, chars: int, is_reply: bool) -> None:
-    """Keep the last few arrivals' shapes, for /status to show."""
+    """Count the arrival and keep the last few shapes, for /status to show.
+
+    "seen" is counted here, in the watcher, rather than in the routing
+    decision, so that it means what a person reading it expects: how many
+    messages arrived. When the two numbers disagreed -- two shapes listed,
+    one decision counted -- the only way to see it was to know that a message
+    had reached no handler at all, which is precisely the thing worth seeing.
+    An arrival with no decision counted is now visible as the gap between the
+    total and the reasons, instead of being invisible.
+    """
     note = _routing_note(chat_id)
+    note["seen"] = note.get("seen", 0) + 1
     note.setdefault("recent", []).append(
         {"shape": describe_shape(kind, chars, is_reply), "at": int(time.time())})
     del note["recent"][:-ROUTING_RECENT]
@@ -538,7 +548,6 @@ def note_arrival(chat_id: int, kind: str, chars: int, is_reply: bool) -> None:
 
 def note_routing(chat_id: int, reason: str) -> None:
     note = _routing_note(chat_id)
-    note["seen"] += 1
     if reason in note:
         note[reason] += 1
     note["last"] = reason
@@ -847,12 +856,24 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             # The one line that says which of the four ways in this group has
             # been used. "وصلني: 0" means Telegram is not delivering anything,
             # which no amount of code reading can reveal.
+            # An arrival that reached no handler is a different fault from one
+            # that reached a handler and was turned away, and the gap between
+            # the two figures is the only place that difference shows.
+            seen = note.get("seen", 0)
+            judged = sum(note.get(k, 0) for k in ("name", "mention", "reply", "no"))
+            unhandled = seen - judged
+            if unhandled:
+                note["unhandled"] = unhandled
+            else:
+                note.pop("unhandled", None)
             where = (f"🧭 هالمحادثة: {getattr(chat, 'title', None) or chat.id} "
                      f"— المعرّف: {chat.id}\n"
-                     f"📊 وصلني: {note.get('seen', 0)} رسالة · "
+                     f"📊 وصلني: {seen} رسالة · "
                      f"اسم: {note.get('name', 0)} · منشن: {note.get('mention', 0)} · "
                      f"رد: {note.get('reply', 0)} · متجاهلة: {note.get('no', 0)}\n"
-                     f"📤 ردت: {note.get('sent', 0)} · فشل: {note.get('failed', 0)}\n"
+                     + (f"🚶 {unhandled} وصلت وما وصلها هاندلر أصلاً\n" if unhandled else "")
+                     + (f"📤 ردت: {note.get('sent', 0)} · فشل: {note.get('failed', 0)}\n"
+                        if ("sent" in note or "failed" in note) else "")
                      + (f"⚠️ آخر خطأ: {note['err']}\n" if note.get("err") else ""))
             # The shapes of the last few arrivals settle the one question the
             # counters cannot: did the message arrive and get ignored, or did it
