@@ -1787,6 +1787,9 @@ async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     Telegram would refuse it too, but with "message can't be deleted" and no
     reason given, which reads as a broken command rather than as the bot
     protecting a student.
+
+    A delete that worked says nothing at all, and that is the whole shape of the
+    command: the message is gone and no second one replaces it.
     """
     message = update.effective_message
     replied = getattr(message, "reply_to_message", None)
@@ -1823,10 +1826,16 @@ async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await message.reply_text(f"صار خطأ: {type(exc).__name__}")
         return
     # The message the command pointed at is gone, so it must not stay in the
-    # memory: a second "/del" would otherwise report success and delete nothing.
+    # memory: a second "/del" would otherwise delete nothing.
     _last_sent.pop(message.chat.id, None)
     logger.info("Deleted message %s in chat %s", message_id, message.chat.id)
-    await message.reply_text("انحذفت.")
+    # Nothing is written back. The owner asked for a message to be taken back,
+    # and a confirmation of that is a second message where the mistake was: in a
+    # class group a bot that says "انحذفت" leaves a trace of the wrong post that
+    # has just been erased, and the whole point of the command is that the post
+    # was not a permanent one. Silence is the confirmation. Failures still speak,
+    # because a delete that did not happen is the one case the owner has to hear
+    # about, and silence there would be a lie.
 
 
 @admin_only
