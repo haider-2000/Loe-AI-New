@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, User
 from telegram.constants import ChatType
-from telegram.error import Conflict, RetryAfter, TelegramError
+from telegram.error import BadRequest, Conflict, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, TypeHandler, filters)
 
@@ -454,6 +454,11 @@ async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE
                     getattr(chat, "id", None), getattr(chat, "title", None),
                     getattr(change.old_chat_member, "status", None),
                     getattr(change.new_chat_member, "status", None))
+        # Being added to a group is the most reliable moment to learn where an
+        # owner announcement should go, and it is the only one that happens when
+        # the group is otherwise silent.
+        if chat is not None and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            remember_announce_group(chat.id)
         return
     kind = "message"
     if update.callback_query is not None:
@@ -471,6 +476,7 @@ async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE
         getattr(chat, "id", None), getattr(chat, "type", None), len(text),
         "yes" if getattr(message, "reply_to_message", None) else "no")
     if chat is not None and chat.type != ChatType.PRIVATE:
+        remember_announce_group(chat.id)
         # What gets recorded is the shape, decided by what the message carries
         # rather than by which handler claimed it, so a message nobody handles
         # is still visible in /status.
@@ -814,6 +820,66 @@ async def set_paused(chat_id: int, paused: bool) -> None:
                      "1" if paused else "0")
 
 
+ANNOUNCE_GROUP_FLAG = "announce_group"
+# The group an owner announcement goes to. There is no group setting in the
+# environment and there should not be one: the bot is in whichever groups it was
+# added to, and the owner announcing homework to the wrong class is a worse
+# mistake than any missing feature. So the group is whichever one the bot last
+# heard from, which is the group being used right now.
+_announce_group: int | None = None
+
+
+async def _store_announce_group(chat_id: int) -> None:
+    try:
+        await write_flag(settings.database_path, ANNOUNCE_GROUP_FLAG, str(chat_id))
+    except Exception:
+        # The running process already knows the group, so only a restart would
+        # lose it, and the next change writes it again. Failing the write is not
+        # worth an announcement that has already been delivered.
+        logger.warning("Could not remember the announcement group %s", chat_id,
+                       exc_info=True)
+
+
+def remember_announce_group(chat_id: int) -> None:
+    """Note a group the bot has just heard from, without waiting for anything.
+
+    Called from the watcher, which sits in front of every single update, so this
+    is the one place that must not await: a remote write costs about a second and
+    the client has no timeout, which is exactly how one slow image used to hold
+    every later message hostage. The write is therefore scheduled, not awaited,
+    and the group only changes when the bot is added somewhere new -- so the
+    deferred task is rare rather than per-message.
+    """
+    global _announce_group
+    if not chat_id or chat_id == _announce_group:
+        return
+    _announce_group = chat_id
+    try:
+        asyncio.create_task(_store_announce_group(chat_id))
+    except RuntimeError:
+        logger.debug("No running loop; the group will be stored on the next change")
+
+
+async def load_announce_group() -> int | None:
+    """Recover the announcement group after a restart, when nothing has arrived yet.
+
+    A fresh container has heard from nobody, so until the first group message
+    the owner has no group to post to and the command would fail for a reason
+    that has nothing to do with the announcement.
+    """
+    global _announce_group
+    if _announce_group is not None:
+        return _announce_group
+    try:
+        stored = await read_flag(settings.database_path, ANNOUNCE_GROUP_FLAG)
+    except Exception:
+        logger.warning("Could not read the announcement group", exc_info=True)
+        return None
+    if stored and stored.lstrip("-").isdigit():
+        _announce_group = int(stored)
+    return _announce_group
+
+
 def active_only(handler):
     """Stay completely silent in a chat that is paused.
 
@@ -888,7 +954,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/addstudent رقم_الحصة | رمز_الطالب\n/roster رقم_الحصة\n"
         "ولكل الطلاب: /lessons لعرض الحصص والمقاعد المتبقية.\n\n"
         "للمدير: بعد ما تراجع المحتوى بـ /pending، اعتمده بـ /approve رقم_العنصر approved بالخاص، "
-        "وبعدين /export يطلع ملف التدريب."
+        "وبعدين /export يطلع ملف التدريب.\n\n"
+        "وتنشر إعلان بالمجموعة: اكتب /post وبعدها الرسالة بالخاص، أو صوّر شي مع تعليق — "
+        "بتروح للمجموعة باسم البوت، بنفس الشكل بالضبط."
     )
 
 
@@ -1052,6 +1120,80 @@ async def roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     students = row["students"]
     listing = "\n".join(f"{i}. {code}" for i, code in enumerate(students, 1)) or "لا يوجد طلاب بعد."
     await update.effective_message.reply_text(f"حضور الحصة #{row['id']} — {row['title']} ({len(students)}/{row['capacity']}):\n{listing}")
+
+
+@private_only
+async def post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Say something in the group as the bot, at the owner's request.
+
+    The owner writes privately and it appears in the class as the bot's own
+    message, which is how a teacher announces homework without a second phone
+    or a screenshot. Deliberately a command rather than any private message: a
+    student asking a real question in private must never be broadcast, and
+    silently reposting someone's homework to 200 people is not recoverable by
+    apologising.
+
+    Telegram's forward is not used. A forward keeps a "forwarded from" header
+    and points at the original message, so the group would see the owner's
+    account and the announcement would be a lie about who is speaking. Sending
+    it as a new message is the whole request.
+    """
+    message = update.effective_message
+    photo = (message.photo or [None])[-1]
+    raw = message.caption if photo is not None else message.text
+    # The command word itself is not the announcement. "/post" with nothing
+    # after it must say how to use the command rather than post the word "post"
+    # to the class, so it is stripped here instead of being left to a length
+    # check that would happily send it.
+    body = re.sub(r"^/post(?:@\S+)?(?:\s+|$)", "", raw or "", count=1).strip()
+    if not body and photo is None:
+        await message.reply_text(
+            "اكتب الرسالة بعد الأمر، أو صوّر شي مع تعليق.\n"
+            "مثال: /post بكرةPc أول — يجيبوا كتاب Chapter 3.")
+        return
+    if body and len(body) > settings.max_message_chars:
+        await message.reply_text("الرسالة طويلة أكثر من الحد المسموح.")
+        return
+    if photo is not None and photo.file_size and photo.file_size > settings.max_download_bytes:
+        await message.reply_text("الصورة أكبر من الحد المسموح (20 MB).")
+        return
+    chat_id = await load_announce_group()
+    if chat_id is None:
+        await message.reply_text(
+            "ما أعرف المجموعة بعد، لأن ما سمعت منها رسالة وحدة.\n"
+            "اكتب أي شي بالمجموعة مرة وحدة، وبتكفّي.")
+        return
+    try:
+        if photo is not None:
+            # The file id is reposted straight back rather than downloaded and
+            # re-uploaded: Telegram already has the bytes, and a round trip
+            # through this container is one more thing that can fail between the
+            # owner pressing the button and the class seeing the picture.
+            await context.bot.send_photo(chat_id, photo.file_id, caption=body or None)
+        else:
+            # Split for the same reason as every other send: the length limit is
+            # a property of the message, not of who asked for it.
+            for chunk in _chunks(body):
+                await context.bot.send_message(chat_id, chunk)
+    except Forbidden:
+        # By far the likeliest failure, and the one the owner can act on: the
+        # group remembered is one the bot has since been removed from, or where
+        # it lost the right to speak.
+        await message.reply_text("ما أگدر أرسل — البوت ما بقى يگدر يچيكي بالمجموعة.")
+        return
+    except BadRequest:
+        await message.reply_text("ما أگدر أرسل — يمكن المجموعة انحذفت.")
+        return
+    except Exception as exc:
+        logger.exception("Announcement to %s failed", chat_id)
+        await message.reply_text(f"صار خطأ وقت الإرسال: {type(exc).__name__}")
+        return
+    logger.info("Announcement delivered to chat %s (%d char(s), %s)",
+                chat_id, len(body), "photo" if photo is not None else "text")
+    # Echoing the text back is the point: the owner confirms what went out, and
+    # a typo is visible here instead of only in the group.
+    await message.reply_text("انرسلت:\n\n" + body if body
+                             else "انرسلت الصورة.")
 
 
 @admin_only
@@ -1865,6 +2007,10 @@ async def post_init(application: Application) -> None:
         " (restored from seed/)" if restored else "",
         f" ({images_back} image(s) restored from the database)" if images_back else "",
     )
+    # Recovered at startup rather than on the first /post, because a fresh
+    # container has heard from nobody and would otherwise refuse an announcement
+    # for the one reason that matters least: it does not know the group yet.
+    await load_announce_group()
     if application is not None:
         await check_group_privacy_mode(application.bot)
         # The flush is scheduled here and not in main(): a task can only be
@@ -1910,6 +2056,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("pause", pause))
     application.add_handler(CommandHandler("quiz", quiz))
     application.add_handler(CommandHandler("progress", progress))
+    application.add_handler(CommandHandler("post", post))
     application.add_handler(CallbackQueryHandler(quiz_topic_picked, pattern=r"^qtopic:"))
     application.add_handler(CallbackQueryHandler(quiz_answered, pattern=r"^qa:"))
     application.add_handler(CallbackQueryHandler(private_consent_answered,
