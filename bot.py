@@ -339,12 +339,17 @@ def note_outcome(chat_id: int | None, sent: bool, error: str = "") -> None:
 # alternative -- deleting whatever a reply points at -- is a way to erase
 # whatever a stranger puts in front of the command.
 #
-# Bounded by age because Telegram itself refuses to delete a message older than
-# 48 hours. An entry that outlived that would not be a longer memory, it would
-# be a promise the API cannot keep: a bare "/del" would find an id and then fail
-# on it. Half that window is still far longer than the gap between posting
-# something and regretting it.
-LAST_MESSAGE_MEMORY_SECONDS = 24 * 3600.0
+# Bounded by age because the bound is Telegram's, not ours. deleteMessage
+# refuses anything older than 48 hours outright, and no argument or delay gets
+# around it: a bot cannot delete a message a week old, and only a human admin
+# tapping "delete" in the app can. So the memory is kept for exactly that
+# window and not a minute longer -- an entry that outlived it would not be a
+# longer memory, it would be an id a bare "/del" finds and then fails on, which
+# is worse than not remembering. Nothing is lost by the choice: the reply shape
+# takes the id from the message it points at, so a bare "/del" is the only path
+# that needs the memory, and the owner who has the message in front of them
+# replies instead.
+LAST_MESSAGE_MEMORY_SECONDS = 48 * 3600.0
 _last_sent: dict[int, tuple[int, float]] = {}
 
 
