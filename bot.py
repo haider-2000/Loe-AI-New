@@ -860,6 +860,29 @@ def remember_announce_group(chat_id: int) -> None:
         logger.debug("No running loop; the group will be stored on the next change")
 
 
+async def show_announce_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Report where an announcement will go, and what /post accepts.
+
+    The group is learned from traffic, which means its value is invisible until
+    it is wrong -- and "the wrong class got my announcement" is only debuggable
+    after the fact. Asking the bot is the cheap way to find out first.
+    """
+    message = update.effective_message
+    chat_id = await load_announce_group()
+    if chat_id is None:
+        await message.reply_text(
+            "ما حددت مجموعة بعد.\n"
+            "اكتب /post -1001234567890 الرسالة، أو /post @اسم_المجموعة الرسالة.")
+        return
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        title = getattr(chat, "title", None) or "بدون اسم"
+    except Exception as exc:
+        logger.warning("Could not name chat %s: %s", chat_id, exc)
+        title = "ما أگدر أعرف اسمها"
+    await message.reply_text(f"الإعلانات تروح لـ: {title}\n{chat_id}")
+
+
 async def load_announce_group() -> int | None:
     """Recover the announcement group after a restart, when nothing has arrived yet.
 
@@ -956,7 +979,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "للمدير: بعد ما تراجع المحتوى بـ /pending، اعتمده بـ /approve رقم_العنصر approved بالخاص، "
         "وبعدين /export يطلع ملف التدريب.\n\n"
         "وتنشر إعلان بالمجموعة: اكتب /post وبعدها الرسالة بالخاص، أو صوّر شي مع تعليق — "
-        "بتروح للمجموعة باسم البوت، بنفس الشكل بالضبط.\n\n"
+        "بتروح للمجموعة باسم البوت، بنفس الشكل بالضبط.\n"
+        "ومرة وحدة تحسم المجموعة: /post -1001234567890 الرسالة، أو /post @اسم_المجموعة الرسالة، "
+        "وبعدها بروح لحاله. و /group يوريك وين تروح الإعلانات.\n\n"
         "وتجاوب سؤال محوّل: حوّل رسالة طالب من المجموعة للخاص واكتب /answer، "
         "بتجاوب بالمجموعة الي إجا منها السؤال، مو بالخاص."
     )
@@ -1239,6 +1264,65 @@ async def _download_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str,
     return data
 
 
+def _split_target(body: str) -> tuple[int | str | None, str]:
+    """Peel an explicit group off the front of an announcement.
+
+    A raw id comes back as an int, an @name as a string, and anything else
+    leaves the message untouched -- a number at the start of a message is far
+    more likely to be part of the message than a group id, so it is only
+    treated as a target when it carries a group's negative id shape or an @
+    """
+    stripped = body.lstrip()
+    if not stripped:
+        return None, body
+    head, _, rest = stripped.partition(" ")
+    if head.startswith("@") and len(head) > 1:
+        return head, rest.strip()
+    # Telegram supergroup ids are negative, which is what keeps a lesson like
+    # "page 12 is the assignment" from being read as a group id.
+    if head.lstrip("-").isdigit() and head.startswith("-"):
+        return int(head), rest.strip()
+    return None, body
+
+
+async def _resolve_announce_target(context: ContextTypes.DEFAULT_TYPE,
+                                   body: str) -> tuple[int | None, str]:
+    """Work out which group an announcement goes to, and remember it if named.
+
+    An explicit target is stored, so the owner types the id once rather than
+    prefixing every announcement -- and a target the bot cannot post to is
+    reported instead of silently falling back to some other group, because an
+    announcement landing in the wrong class is not recoverable by resending.
+    """
+    target, body = _split_target(body)
+    if isinstance(target, int):
+        _set_announce_group(target)
+        return target, body
+    if isinstance(target, str):
+        try:
+            chat = await context.bot.get_chat(target)
+        except Exception as exc:
+            logger.warning("Could not resolve %s: %s", target, exc)
+            return None, body
+        chat_id = getattr(chat, "id", None)
+        if chat_id is None:
+            return None, body
+        _set_announce_group(chat_id)
+        return chat_id, body
+    return await load_announce_group(), body
+
+
+def _set_announce_group(chat_id: int) -> None:
+    global _announce_group
+    if chat_id == _announce_group:
+        return
+    _announce_group = chat_id
+    try:
+        asyncio.create_task(_store_announce_group(chat_id))
+    except RuntimeError:
+        logger.debug("No running loop; the group will be stored on the next change")
+
+
 @private_only
 async def post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Say something in the group as the bot, at the owner's request.
@@ -1274,11 +1358,18 @@ async def post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if photo is not None and photo.file_size and photo.file_size > settings.max_download_bytes:
         await message.reply_text("الصورة أكبر من الحد المسموح (20 MB).")
         return
-    chat_id = await load_announce_group()
+    # The target can be named outright, and learning it by listening is only the
+    # fallback. Deriving the group from "the last one that spoke" means the
+    # first announcement after a fresh deploy fails, because nothing has been
+    # heard yet -- so the feature is broken exactly when it is first tried.
+    chat_id, body = await _resolve_announce_target(context, body)
     if chat_id is None:
         await message.reply_text(
-            "ما أعرف المجموعة بعد، لأن ما سمعت منها رسالة وحدة.\n"
-            "اكتب أي شي بالمجموعة مرة وحدة، وبتكفّي.")
+            "ما أعرف المجموعة بعد.\n"
+            "اكتب رقمها قبل الرسالة:\n"
+            "  /post -1003560630016 الرسالة\n"
+            "أو آخذ اسم المجموعة: /post @اسم_المجموعة الرسالة\n"
+            "وأحفظها، فالمرة الجاية بروح لحالها.")
         return
     try:
         if photo is not None:
@@ -2176,6 +2267,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("post", post))
     application.add_handler(CommandHandler("answer", answer_forwarded))
     application.add_handler(CommandHandler("a", answer_forwarded))
+    application.add_handler(CommandHandler("group", show_announce_group))
     application.add_handler(CallbackQueryHandler(quiz_topic_picked, pattern=r"^qtopic:"))
     application.add_handler(CallbackQueryHandler(quiz_answered, pattern=r"^qa:"))
     application.add_handler(CallbackQueryHandler(private_consent_answered,
