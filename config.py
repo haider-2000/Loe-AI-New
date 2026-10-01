@@ -32,6 +32,19 @@ class Settings:
     gemini_api_key: str
     admin_id: int
     gemini_model: str = "gemini-3.5-flash-lite"
+    # A second, separate key used for one job only: deciding whether a group
+    # message is meant for the bot. Empty means that gate is off and the bot
+    # answers only when it is named, mentioned or replied to -- which is the
+    # behaviour that worked before this existed, so an unset key is not a
+    # degraded mode but the original one. It is a separate key rather than a
+    # second setting on the first because the gate runs on every message a group
+    # receives, including the ones that are ignored; on a shared key that traffic
+    # would spend the quota the actual answers need.
+    router_api_key: str = ""
+    # Deliberately the cheapest model in the chain: the gate reads a little
+    # context and answers one word, so a larger model would cost more to be right
+    # about less.
+    router_model: str = "gemini-3.5-flash-lite"
     database_path: str = "data/edu_bot.db"
     max_download_bytes: int = 20 * 1024 * 1024
     max_message_chars: int = 12000
@@ -62,6 +75,12 @@ class Settings:
             gemini_api_key=gemini_key,
             admin_id=int(admin_raw),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip() or "gemini-3.5-flash-lite",
+            # Optional on purpose. Absent or blank and the bot behaves exactly as
+            # it did before the gate existed, which is why this is not validated
+            # the way TELEGRAM_BOT_TOKEN and GEMINI_API_KEY are: turning the gate
+            # on is a decision, not a requirement for the bot to run.
+            router_api_key=os.getenv("ROUTER_API_KEY", "").strip(),
+            router_model=os.getenv("ROUTER_MODEL", "gemini-3.5-flash-lite").strip() or "gemini-3.5-flash-lite",
             # DB_URL wins: on Render it points at a remote database, because the
             # container disk there is wiped on every restart. A libsql:// value
             # lands in the same field as a plain local path.

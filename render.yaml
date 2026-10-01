@@ -29,6 +29,15 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      # A second, separate Gemini key for one job only: deciding whether a group
+      # message is meant for the bot, so it can answer a plain question in a group
+      # without its name in it. Optional. Leave it unset and the bot behaves
+      # exactly as it did before this existed -- it answers when named, mentioned
+      # or replied to, and ignores the rest. It is a separate key because the gate
+      # runs on every message a group receives, including the ignored ones, and
+      # that traffic would otherwise spend the quota the real answers need.
+      - key: ROUTER_API_KEY
+        sync: false
       - key: ADMIN_ID
         sync: false
       # The free remote database that survives container restarts:
@@ -43,6 +52,12 @@ services:
       # The lite model: the larger ones were returning 429/503 from this account.
       # gemini_client.py still falls back to the rest of the chain on failure.
       - key: GEMINI_MODEL
+        value: "gemini-3.5-flash-lite"
+      # The gate gets the cheapest model in the chain: it reads a little context
+      # and answers one word, so a larger one would cost more to be right about
+      # less. Has a working default in config.py, set here to make the choice
+      # visible in one place.
+      - key: ROUTER_MODEL
         value: "gemini-3.5-flash-lite"
       # This one has a working default in config.py:
       #   DATABASE_PATH   -> data/edu_bot.db

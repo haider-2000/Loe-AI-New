@@ -106,6 +106,11 @@ logger = logging.getLogger(__name__)
 
 settings: Settings
 ai: GeminiClient
+# The relevance gate: a second client on a second key, built only when
+# ROUTER_API_KEY is set. None means the gate is off, and off is the behaviour
+# this bot had for its whole life -- answer when named, ignore the rest -- so a
+# missing key costs nothing but the feature.
+router: GeminiClient | None = None
 # What the bot remembers between messages, so "and the second one?" keeps
 # pointing at the same topic instead of starting from nothing.
 memory = ConversationMemory()
@@ -472,10 +477,60 @@ def is_command(message: Any) -> bool:
     return any(getattr(entity, "type", None) == "bot_command" for entity in entities)
 
 
+# The last few group messages, per chat, so the relevance gate can read the
+# conversation instead of one line lifted out of it. Text only, and only the tail:
+# enough to know what the class has been discussing, not a transcript.
+#
+# Held in memory and never written to the database. The dataset is for question
+# and answer pairs the tutor produced, and this is other students' chat, so
+# putting it there would make it survive a restart and end up in an export --
+# which is not what anyone asked for when they sent a message to a group.
+GROUP_CONTEXT_MESSAGES = 12
+# Long enough to cover a class period's exchange, short enough that a message
+# from this morning cannot make tonight's message look like a follow-up to it.
+GROUP_CONTEXT_SECONDS = 1800.0
+_group_context: dict[int, list[tuple[float, str]]] = {}
+
+
+def remember_group_message(chat_id: int, message: Any) -> None:
+    """Keep the tail of a group's text, for the relevance gate to read later."""
+    if chat_id is None or is_command(message):
+        return
+    text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+    if not text:
+        # An attachment with no words carries no signal for the gate, and its
+        # bytes are handled by the media handlers. It is described as a shape so
+        # the gate knows something arrived without being handed the file.
+        if any(getattr(message, field, None) for field in ("photo", "voice", "document")):
+            text = "[صورة]" if getattr(message, "photo", None) else (
+                "[رسالة صوتية]" if getattr(message, "voice", None) else "[ملف]")
+        else:
+            return
+    entries = _group_context.setdefault(chat_id, [])
+    entries.append((time.time(), text[:600]))
+    now = time.time()
+    # Cut by age as well as by count: a chat id never goes away, and a class that
+    # stopped months ago should not keep its last words on the machine.
+    _group_context[chat_id] = [e for e in entries
+                               if now - e[0] <= GROUP_CONTEXT_SECONDS][-GROUP_CONTEXT_MESSAGES:]
+
+
+def recent_group_messages(chat_id: int) -> list[str]:
+    """The last group messages, oldest first, for the gate to read."""
+    now = time.time()
+    entries = [e for e in _group_context.get(chat_id, ()) if now - e[0] <= GROUP_CONTEXT_SECONDS]
+    return [text for _, text in entries]
+
+
+def forget_group_context(chat_id: int) -> None:
+    """Drop a chat's remembered lines, so /forget clears it too."""
+    _group_context.pop(chat_id, None)
+
+
 async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Record that an update arrived at all, whatever it turned out to be.
 
-    The routing log inside directed_to_bot only fires for a message that
+    The routing log inside should_answer only fires for a message that
     reached a handler. If Telegram delivers something this bot has no handler
     for -- an edited message, a poll, a giveaway -- that leaves no trace at all,
     and a group that has gone quiet cannot be told apart from one whose messages
@@ -527,6 +582,13 @@ async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE
             remember_forward_chat(message, forwarded)
     if chat is not None and chat.type != ChatType.PRIVATE:
         remember_announce_group(chat.id)
+        # The tail of this group, kept so the relevance gate can read a
+        # question in the context it was asked in. In memory only and never
+        # written out, and the bot's own answer is skipped so it cannot answer
+        # itself.
+        if kind == "message" and not (
+                getattr(getattr(message, "from_user", None), "is_bot", False)):
+            remember_group_message(chat.id, message)
         # What gets recorded is the shape, decided by what the message carries
         # rather than by which handler claimed it, so a message nobody handles
         # is still visible in /status.
@@ -592,15 +654,16 @@ _SHAPE_WORDS = {
 
 def _routing_note(chat_id: int) -> dict[str, Any]:
     return _ROUTING_NOTES.setdefault(
-        chat_id, {"seen": 0, "name": 0, "mention": 0, "reply": 0, "no": 0,
-                  "last": None, "at": 0, "recent": []})
+        chat_id, {"seen": 0, "name": 0, "mention": 0, "reply": 0, "gate": 0,
+                  "no": 0, "last": None, "at": 0, "recent": []})
 
 
-# Which of the four ways in this message used, in words a student can act on.
+# Which way in this message used, in words a student can act on.
 _WHY_WORDS = {
     "name": "✔️ عرفها: اسمك أولها",
     "mention": "✔️ عرفها: منشنك",
     "reply": "✔️ عرفها: رد على رسالتي",
+    "gate": "✔️ عرفها: البوابة قرأت إنها سؤال للمعلّم",
     "no": "🚫 ما عرفها — لازم اسمك أول الكابشن",
 }
 
@@ -785,8 +848,94 @@ def routing_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
     return reason
 
 
+async def should_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Whether this message is for the bot: named, mentioned, replied to, or about him.
+
+    The name, the @handle and the reply are free and certain, so they are
+    answered first and the gate is never asked about them. Only a message that
+    arrived at nothing -- the one case the bot previously dropped -- reaches the
+    gate, which reads the surrounding lines and decides whether this is a
+    question the class is waiting on an answer to.
+
+    The gate is asked once per message and its verdict is counted as the routing
+    reason, so /status shows "the bot answered because the gate read it as a
+    question" separately from a name in the caption. That separation is the point
+    of the feature: once the bot starts answering unaddressed messages, a group
+    that stops is either a gate that says no or a gate that is not running, and
+    those look identical without the count.
+    """
+    reason, chat_id = _judge(update, context)
+    if reason != "no":
+        if chat_id is not None:
+            note_routing(chat_id, reason)
+        return True
+    if chat_id is not None:
+        if await gate_reads_it_as_a_question(update, chat_id):
+            note_routing(chat_id, "gate")
+            return True
+        note_routing(chat_id, "no")
+    return False
+
+
+def _judge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, int | None]:
+    """The routing reason, and the chat to record it against, or None.
+
+    A private message is not a routing decision at all, so it has no chat id to
+    be counted under; the four group reasons all have one.
+    """
+    reason = routing_reason(update, context)
+    chat = getattr(update, "effective_chat", None)
+    if reason == "private" or chat is None:
+        return reason, None
+    return reason, chat.id
+
+
+async def gate_reads_it_as_a_question(update: Update, chat_id: int) -> bool:
+    """Ask the separate-key gate whether this message is meant for the bot.
+
+    A second key and a second client, not a flag on the existing one. The gate
+    runs on every message a group sends, including the ones nobody wanted
+    answered, which is a different kind of traffic from the questions the tutor
+    actually answers and deserves its own quota and its own model choice.
+
+    Every failure answers no. A missing key, a busy model, a refused call or a
+    verdict that is neither yes nor no all mean the same thing, and it is the
+    thing that was true before this existed: the bot does not answer messages
+    that did not name it.
+    """
+    if router is None:
+        return False
+    message = update.effective_message
+    if message is None or is_command(message):
+        return False
+    if getattr(getattr(message, "from_user", None), "is_bot", False):
+        # Another bot's message is never a question for this one, and in a group
+        # that runs bots the calls would otherwise cost a request each.
+        return False
+    text = message.text or message.caption or ""
+    try:
+        verdict = await router.wants_reply(text, recent_group_messages(chat_id))
+    except Exception:
+        # A gate that raises must not take the tutor down: the reply it was
+        # deciding about is still answerable when it was named.
+        logger.warning("Relevance gate failed, staying quiet",
+                       exc_info=True)
+        return False
+    if verdict is None:
+        return False
+    logger.info("group %s: gate says %s for message %s",
+                chat_id, "yes" if verdict else "no",
+                getattr(message, "message_id", None))
+    return verdict
+
+
 def directed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Whether this message is the bot being spoken to.
+    """Whether this message is the bot being spoken to, by the three sure signs.
+
+    The handlers do not call this: they call should_answer, which is this plus
+    the relevance gate. It stays as the plain routing decision because it is
+    answerable without a network call, and because "would the bot have picked
+    this up before the gate existed" has to stay checkable on its own.
 
     In a group there are three ways in, checked in the order a student is most
     likely to use them: the @handle, the bare name, or a reply to the bot. The
@@ -1050,9 +1199,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @allowed_chat_only
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Stated from the live state of the gate rather than written once, because the
+    # sentence is now a promise about behaviour: with the gate on, a plain question
+    # is answered, and telling a class to always add a name would be wrong advice
+    # that makes the feature look broken.
+    in_group = (
+        "بالgroup تكفي تسأل عادي، وأنا أقرأ السياق وأجاوب إذا السؤال كان للمجموعة كلها."
+        if router is not None else
+        "بالgroup ما أرد على كل الرسائل؛ اكتب اسمي (leo أو ليو) بأول السؤال، أو رد على رسالتي."
+    )
     await update.effective_message.reply_text(
         "الأوامر المتاحة:\n/start - بدء الاستخدام\n/help - المساعدة\n/privacy - الخصوصية\n/status - حالة الخدمة\n/quiz الموضوع - اختبار\n/progress - نتائجك\n/forget - نسيان آخر المواضيع\n/cancel - إلغاء العملية الحالية\n"
-        "بالمجموعة ما أرد على كل الرسائل؛ اكتب اسمي (leo أو ليو) بأول السؤال، أو رد على رسالتي.\n\n"
+        + in_group + "\n\n"
         "وتكتب /quiz تطلع لك قائمة باختصاصات الذكاء الاصطناعي تختار منها، أو تكتب /quiz الموضوع مباشرة مثل /quiz تعلم الآلة.\n"
         "كل اختبار ٥ أسئلة اختيار من متعدد، تجاوب بالأزرار (أ ب ج د) وتعرف النتيجة مع شرح ليش جوابك صح أو غلط.\n"
         "النتائج تنحفظ لكل طالب لحاله وتگدر تشوفها بـ /progress.\n\n"
@@ -1084,6 +1242,11 @@ async def privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "الصور التعليمية والنصوص المفيدة تدخل مراجعة داخلية، وأي محتوى عليه مؤشرات شخصية واضحة يُعلّم privacy_flag ويُستبعد من التصدير. "
         "ذاكرة المحادثة (آخر ٥ أسئلة وجواباتها) تبقى بجهاز الخادم فقط، لكل طالب على حدة، "
         "وما تنكتب بالداتابيز ولا بالنسخة الاحتياطية، وتروح لما يعيد الخادم يشتغل — وبتقدر تمسحها فوراً بـ /forget."
+        + (
+            "\nوبالمجموعات، إذا البوابة تشتغل: آخر ١٢ رسالة بالـ30 دقيقة بتفهمها لأجل الحكم إذا السؤال "
+            "للمجموعة، وهي بجهاز الخادم فقط، ما تنكتب بالداتابيز ولا بالنسخة الاحتياطية، وبتقدر تمسحها بـ /forget."
+            if router is not None else ""
+        )
     )
 
 
@@ -1091,6 +1254,13 @@ async def privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     key = thread_key(update)
     dropped = memory.forget(*key) if key else 0
+    chat = update.effective_chat
+    if chat is not None and chat.type != ChatType.PRIVATE:
+        # The lines the gate reads are another kind of memory about the group,
+        # not about the student, and /forget is the command that says stop
+        # remembering. It is not counted in `dropped` because that number counts
+        # questions, and clearing the context forgets none.
+        forget_group_context(chat.id)
     if dropped:
         await update.effective_message.reply_text(f"انسيت آخر {dropped} سؤال. بكرة نبدأ من جديد.")
     else:
@@ -1116,8 +1286,22 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                  "وبعدين أعيد تشغيل البوت. لينها، «ليو سؤال» بالمجموعة ما راح يوصلني.")
     elif reads_all_group_messages:
         reach = "\n📨 أقرأ كل رسائل المجموعات، فـ«ليو سؤال» يوصلني بدون منشن."
+    elif router is not None:
+        # Without every message there is nothing for the gate to read the
+        # conversation out of, so this is the fault that looks like the gate
+        # being broken rather than a misconfiguration.
+        reach = ("\n🚦 البوابة تشتغل، بس تيليجرام ما يوصلني إلا المنشن والأوامر. "
+                 "لازم تطفي Privacy Mode من @BotFather: /setprivacy ثم اختر البوت ثم Disable، "
+                 "وبعدين أعيد تشغيل البوت.")
     else:
         reach = ""
+    # Whether the gate is running, said outside the per-chat block: it is a
+    # property of this bot, not of one group, and it is the first thing to check
+    # when a group goes quiet after a deploy that added a key. A missing secret
+    # looks exactly like a broken feature from inside Telegram.
+    reach += ("\n🚦 البوابة: شغالة على " + settings.router_model
+              if router is not None else
+              "\n🚦 البوابة: مقفلة (ماكو ROUTER_API_KEY) — أرد بس إذا جات اسمي")
     # A group that goes quiet is almost always the wrong group, and the chat id
     # is the only thing that settles it. Naming the chat here means the answer
     # comes back in Telegram instead of from a log nobody has open.
@@ -1133,7 +1317,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             # that reached a handler and was turned away, and the gap between
             # the two figures is the only place that difference shows.
             seen = note.get("seen", 0)
-            judged = sum(note.get(k, 0) for k in ("name", "mention", "reply", "no"))
+            judged = sum(note.get(k, 0) for k in ("name", "mention", "reply", "gate", "no"))
             unhandled = seen - judged
             if unhandled:
                 note["unhandled"] = unhandled
@@ -1143,7 +1327,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                      f"— المعرّف: {chat.id}\n"
                      f"📊 وصلني: {seen} رسالة · "
                      f"اسم: {note.get('name', 0)} · منشن: {note.get('mention', 0)} · "
-                     f"رد: {note.get('reply', 0)} · متجاهلة: {note.get('no', 0)}\n"
+                     f"رد: {note.get('reply', 0)} · "
+                     f"بوابة: {note.get('gate', 0)} · متجاهلة: {note.get('no', 0)}\n"
                      + (f"🚶 {unhandled} وصلت وما وصلها هاندلر أصلاً\n" if unhandled else "")
                      + (f"📤 ردت: {note.get('sent', 0)} · فشل: {note.get('failed', 0)}\n"
                         if ("sent" in note or "failed" in note) else "")
@@ -1165,7 +1350,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 # name can go, and a caption that misses it fails silently. Say
                 # how to reach the bot, in the same message that shows the miss.
                 if any(entry.get("why") == "no" for entry in recent):
-                    where += ("💡 بالصورة، اكتب `ليو` أول الكابشن لحالها، "
+                    # Said from the live state, because with the gate on a name in
+                    # the caption is no longer the only way in, and telling the
+                    # class otherwise is advice for a bot that is not running.
+                    where += ("💡 بالبوت شغالة تقدر تسأل عادي، وإذا ما جاوب "
+                              "اكتب `ليو` أول الكابشن لحالها.\n" if router is not None else
+                              "💡 بالصورة، اكتب `ليو` أول الكابشن لحالها، "
                               "والسؤال بالكتابة أو بالصورة نفسها.\n")
         else:
             where = (f"🧭 هالمحادثة: {getattr(chat, 'title', None) or chat.id} "
@@ -1843,7 +2033,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     once and answered, it is not a dataset item, so there is no file for a later
     restart to lose. Only the question and the answer are kept, as text.
     """
-    if not directed_to_bot(update, context):
+    if not await should_answer(update, context):
         return
     message = update.effective_message
     document = message.document
@@ -1897,7 +2087,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 @allowed_chat_only
 @active_only
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not directed_to_bot(update, context):
+    if not await should_answer(update, context):
         return
     message = update.effective_message
     chat_id = update.effective_chat.id
@@ -1939,7 +2129,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 @allowed_chat_only
 @active_only
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not directed_to_bot(update, context):
+    if not await should_answer(update, context):
         return
     message = update.effective_message
     photo = message.photo[-1]
@@ -2002,7 +2192,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 @allowed_chat_only
 @active_only
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not directed_to_bot(update, context):
+    if not await should_answer(update, context):
         return
     message = update.effective_message
     voice = message.voice
@@ -2534,11 +2724,22 @@ def main() -> None:
     rebuilt from scratch each time because a stopped application cannot be
     started again.
     """
-    global settings, ai, health_port
+    global settings, ai, router, health_port
     settings = Settings.from_env()
     ai = GeminiClient(settings.gemini_api_key, settings.gemini_model)
+    # Built only when the key is there, on its own model and its own client, so
+    # the traffic the gate generates cannot spend the quota the answers need.
+    # Unset is not an error: the bot then answers only when it is named, which
+    # is what it always did, and /status says the gate is off so nobody goes
+    # looking for a bug that is a missing environment variable.
+    if settings.router_api_key:
+        router = GeminiClient(settings.router_api_key, settings.router_model)
+    else:
+        router = None
     health_port = start_health_server()
     logger.info("Leo starting with model %s", settings.gemini_model)
+    logger.info("Relevance gate: %s", f"on, model {settings.router_model}"
+                if router is not None else "off (no ROUTER_API_KEY)")
     attempt = 0
     while True:
         application = build_application()
