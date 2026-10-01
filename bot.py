@@ -14,6 +14,7 @@ from datetime import datetime
 from functools import wraps
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -321,6 +322,46 @@ def note_outcome(chat_id: int | None, sent: bool, error: str = "") -> None:
     note["at"] = int(time.time())
 
 
+# The last message the bot sent in each chat, so /del can take it back without
+# the owner having to find and reply to the exact message. Keyed by chat id
+# rather than by anything about the message, because the command and the message
+# it removes do not have to arrive in the same order: an announcement goes out to
+# the group and the owner decides to kill it while reading it there.
+#
+# Only ever written with messages the bot itself sent, which is what makes a
+# remembered id safe to delete: a bot may delete its own messages, and the
+# alternative -- deleting whatever a reply points at -- is a way to erase
+# whatever a stranger puts in front of the command.
+#
+# Bounded by age because Telegram itself refuses to delete a message older than
+# 48 hours. An entry that outlived that would not be a longer memory, it would
+# be a promise the API cannot keep: a bare "/del" would find an id and then fail
+# on it. Half that window is still far longer than the gap between posting
+# something and regretting it.
+LAST_MESSAGE_MEMORY_SECONDS = 24 * 3600.0
+_last_sent: dict[int, tuple[int, float]] = {}
+
+
+def remember_sent(chat_id: Any, sent: Any) -> None:
+    """Note a message the bot just sent, so /del can find it again."""
+    message_id = getattr(sent, "message_id", None)
+    if chat_id is None or message_id is None:
+        return
+    _last_sent[chat_id] = (message_id, time.time())
+
+
+def last_sent_in(chat_id: Any) -> int | None:
+    """The bot's last message id in a chat, if one is still remembered."""
+    entry = _last_sent.get(chat_id)
+    if entry is None:
+        return None
+    message_id, seen = entry
+    if time.time() - seen > LAST_MESSAGE_MEMORY_SECONDS:
+        _last_sent.pop(chat_id, None)
+        return None
+    return message_id
+
+
 async def reply_answer(message, text: str) -> None:
     """Send an answer, splitting it if it exceeds what Telegram accepts.
 
@@ -331,7 +372,7 @@ async def reply_answer(message, text: str) -> None:
     for chunk in _chunks(text):
         for attempt in range(3):
             try:
-                await message.reply_text(chunk)
+                remember_sent(chat_id, await message.reply_text(chunk))
                 note_outcome(chat_id, True)
                 break
             except RetryAfter as exc:
@@ -905,6 +946,7 @@ def remember_announce_group(chat_id: int) -> None:
         logger.debug("No running loop; the group will be stored on the next change")
 
 
+@admin_only
 async def show_announce_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Report where an announcement will go, and what /post accepts.
 
@@ -1028,7 +1070,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "ومرة وحدة تحسم المجموعة: /post -1001234567890 الرسالة، أو /post @اسم_المجموعة الرسالة، "
         "وبعدها بروح لحاله. و /group يوريك وين تروح الإعلانات.\n\n"
         "وتجاوب سؤال محوّل: حوّل رسالة طالب من المجموعة للخاص واكتب /answer، "
-        "بتجاوب بالمجموعة الي إجا منها السؤال، مو بالخاص."
+        "بتجاوب بالمجموعة الي إجا منها السؤال، مو بالخاص.\n\n"
+        "وإذا ندمت على شي بعثه البوت: اكتب /del لحاله — بتمسح آخر رسالة بعثها البوت "
+        "بهالمحادثة — أو ترد على رسالته وتحط /del، فتحديد الي تريد تمسحها."
     )
 
 
@@ -1324,7 +1368,8 @@ async def answer_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 return
             data = await _download_bytes(context, photo.file_id, settings.max_download_bytes)
             answer = await ai.answer_image(data, "image/jpeg", body)
-            await context.bot.send_photo(chat_id, photo.file_id, caption=answer)
+            remember_sent(chat_id, await context.bot.send_photo(chat_id, photo.file_id,
+                                                                caption=answer))
         elif document is not None:
             limit = settings.max_document_bytes
             if document.file_size and document.file_size > limit:
@@ -1333,13 +1378,16 @@ async def answer_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             data = await _download_bytes(context, document.file_id, limit)
             mime = getattr(document, "mime_type", None) or "application/octet-stream"
             answer = await ai.answer_file(data, mime, body)
-            await context.bot.send_document(chat_id, document.file_id, caption=answer)
+            remember_sent(chat_id, await context.bot.send_document(chat_id, document.file_id,
+                                                                   caption=answer))
         else:
             answer = await ai.answer_text(body)
             # Split for the same reason as every other send: the limit is a
-            # property of the message, not of who asked for the answer.
+            # property of the message, not of who asked for the answer. Only the
+            # last chunk is remembered, because a bare "/del" is one deletion and
+            # deleting the tail of a split answer would leave its head behind.
             for chunk in _chunks(answer):
-                await context.bot.send_message(chat_id, chunk)
+                remember_sent(chat_id, await context.bot.send_message(chat_id, chunk))
     except Forbidden:
         await message.reply_text("ما أگدر أرسل بالمجموعة — تأكد البوت لسه فيها وصلاحية إرسال.")
         return
@@ -1490,12 +1538,15 @@ async def post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             # re-uploaded: Telegram already has the bytes, and a round trip
             # through this container is one more thing that can fail between the
             # owner pressing the button and the class seeing the picture.
-            await context.bot.send_photo(chat_id, photo.file_id, caption=body or None)
+            remember_sent(chat_id, await context.bot.send_photo(chat_id, photo.file_id,
+                                                                caption=body or None))
         else:
             # Split for the same reason as every other send: the length limit is
-            # a property of the message, not of who asked for it.
+            # a property of the message, not of who asked for the answer. Only
+            # the last chunk is remembered, so a "/del" after a long announcement
+            # removes its tail rather than silently eating the whole thing.
             for chunk in _chunks(body):
-                await context.bot.send_message(chat_id, chunk)
+                remember_sent(chat_id, await context.bot.send_message(chat_id, chunk))
     except Forbidden:
         # By far the likeliest failure, and the one the owner can act on: the
         # group remembered is one the bot has since been removed from, or where
@@ -1515,6 +1566,64 @@ async def post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # a typo is visible here instead of only in the group.
     await message.reply_text("انرسلت:\n\n" + body if body
                              else "انرسلت الصورة.")
+
+
+@admin_only
+async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Take back the bot's last message, so a wrong post is not a permanent one.
+
+    Two shapes, because there are two moments. Replying to a message says which
+    one: the owner can see the mistake, or cannot see it, and replying removes the
+    guesswork from both. A bare "/del" is for when the owner already knows what
+    went out and does not want to hunt for it -- the bot remembers what it last
+    sent in that chat and deletes exactly that.
+
+    A remembered id is only ever written by this bot's own sends, so the bare
+    shape cannot be aimed at a student. The reply shape is the one that could be,
+    so it checks who wrote the message being pointed at and refuses otherwise.
+    Telegram would refuse it too, but with "message can't be deleted" and no
+    reason given, which reads as a broken command rather than as the bot
+    protecting a student.
+    """
+    message = update.effective_message
+    replied = getattr(message, "reply_to_message", None)
+    bot_id = getattr(getattr(context, "bot", None), "id", None)
+    if replied is not None:
+        author = getattr(replied, "from_user", None)
+        if bot_id is None or author is None or author.id != bot_id:
+            await message.reply_text("هذي مو رسالة البوت — ما أگدر أحذفها.")
+            return
+        message_id = replied.message_id
+    else:
+        message_id = last_sent_in(getattr(getattr(message, "chat", None), "id", None))
+        if message_id is None:
+            await message.reply_text(
+                "ما أگدر ألگى رسالة بعثتها هالمحادثة.\n"
+                "أو ترد على الرسالة وتحط /del — بجيحة الرسالة الي تريد تحذفها.")
+            return
+    try:
+        await context.bot.delete_message(message.chat.id, message_id)
+    except BadRequest as exc:
+        # Telegram's wording is deliberately unhelpful: a message older than 48
+        # hours, one from a different chat and one that was never sent all come
+        # back the same way. The detail goes to the log; the owner gets the
+        # likeliest cause, because a command that says "it failed" and nothing
+        # else is not actionable.
+        logger.warning("Delete of %s in %s refused: %s", message_id, message.chat.id, exc)
+        await message.reply_text("ما أگدر أحذفها — يمكن صارت أقدم من ٤٨ ساعة.")
+        return
+    except Forbidden:
+        await message.reply_text("ما أگدر أحذف — البوت ما بقى يگدر يحذف بهالمجموعة.")
+        return
+    except Exception as exc:
+        logger.exception("Delete of %s in %s failed", message_id, message.chat.id)
+        await message.reply_text(f"صار خطأ: {type(exc).__name__}")
+        return
+    # The message the command pointed at is gone, so it must not stay in the
+    # memory: a second "/del" would otherwise report success and delete nothing.
+    _last_sent.pop(message.chat.id, None)
+    logger.info("Deleted message %s in chat %s", message_id, message.chat.id)
+    await message.reply_text("انحذفت.")
 
 
 @admin_only
@@ -2381,6 +2490,10 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("answer", answer_forwarded))
     application.add_handler(CommandHandler("a", answer_forwarded))
     application.add_handler(CommandHandler("group", show_announce_group))
+    # "del" and the full word, because both are what people try first and a
+    # command that exists under one name and not the other reads as a bug.
+    application.add_handler(CommandHandler("del", delete_last))
+    application.add_handler(CommandHandler("delete", delete_last))
     application.add_handler(CallbackQueryHandler(quiz_topic_picked, pattern=r"^qtopic:"))
     application.add_handler(CallbackQueryHandler(quiz_answered, pattern=r"^qa:"))
     application.add_handler(CallbackQueryHandler(private_consent_answered,
