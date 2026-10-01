@@ -475,6 +475,15 @@ async def log_arriving_update(update: Update, context: ContextTypes.DEFAULT_TYPE
         getattr(update, "update_id", None), kind,
         getattr(chat, "id", None), getattr(chat, "type", None), len(text),
         "yes" if getattr(message, "reply_to_message", None) else "no")
+    if chat is not None and chat.type == ChatType.PRIVATE and message is not None:
+        # A question forwarded into the owner's private chat has to be
+        # answerable by a follow-up "/a" that carries no forward of its own, and
+        # the two messages have no link to each other. The watcher is the only
+        # thing that sees both, so this is where the pairing is kept -- and
+        # still without awaiting, since it sits in front of every update.
+        forwarded = _origin_chat_id(message)
+        if forwarded is not None:
+            remember_forward_chat(message, forwarded)
     if chat is not None and chat.type != ChatType.PRIVATE:
         remember_announce_group(chat.id)
         # What gets recorded is the shape, decided by what the message carries
@@ -829,6 +838,42 @@ ANNOUNCE_GROUP_FLAG = "announce_group"
 _announce_group: int | None = None
 
 
+# The most recent question forwarded into each private chat, kept as the message
+# itself and not just its group. The owner forwards and then types "/a" as a
+# separate message, and neither carries a link to the other, so the command has
+# to find both *where* the question came from and *what* it said. Remembering
+# only the group left a bare "/a" with nowhere to post and nothing to ask, and
+# it reported that no question had been forwarded seconds after one was.
+#
+# Keyed by the chat object rather than its id because it is only ever read while
+# handling that same chat's next message, and holding one chat's question under
+# another's key would answer the wrong class.
+_last_forward: dict[int, tuple[Any, int]] = {}
+
+# How long a remembered forward stays usable. Long enough to cover the seconds
+# between forwarding and typing, short enough that a forgotten forward does not
+# send tomorrow's answer to yesterday's class. Only consulted when the message
+# carries no origin of its own, so a real forward is never affected.
+FORWARD_MEMORY_SECONDS = 900.0
+_last_forward_at: dict[int, float] = {}
+
+
+def remember_forward_chat(message: Any, chat_id: int) -> None:
+    """Note the question just forwarded into this private chat, and where it came from."""
+    chat = getattr(message, "chat", None)
+    if chat is None:
+        return
+    _last_forward[id(chat)] = (message, chat_id)
+    _last_forward_at[id(chat)] = time.time()
+
+
+def _expire_forward(chat_key: int) -> None:
+    seen = _last_forward_at.get(chat_key)
+    if seen is not None and time.time() - seen > FORWARD_MEMORY_SECONDS:
+        _last_forward.pop(chat_key, None)
+        _last_forward_at.pop(chat_key, None)
+
+
 async def _store_announce_group(chat_id: int) -> None:
     try:
         await write_flag(settings.database_path, ANNOUNCE_GROUP_FLAG, str(chat_id))
@@ -1149,8 +1194,8 @@ async def roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(f"حضور الحصة #{row['id']} — {row['title']} ({len(students)}/{row['capacity']}):\n{listing}")
 
 
-def _forwarded_chat_id(message: Any) -> int | None:
-    """The group a message was forwarded from, or None if it was not forwarded.
+def _origin_chat_id(message: Any) -> int | None:
+    """The group a single message was forwarded from, or None.
 
     Telegram delivers the origin rather than a group reference, and the shape
     differs by what the source was: a forward from another group or a channel
@@ -1177,6 +1222,41 @@ def _forwarded_chat_id(message: Any) -> int | None:
     return None
 
 
+def _forwarded_chat_id(message: Any) -> int | None:
+    """The group to answer a forwarded question in.
+
+    Three places carry it, and in practice the owner uses whichever Telegram
+    makes easiest, so all three are read. The message itself, when the command
+    was typed on the forward. The message it replies to, because replying to a
+    forward is what typing a separate "/a" next to it does. And the most recent
+    forward in this private chat, because the common shape is two messages --
+    forward, then command -- and there is no reply link between them at all.
+
+    Only the last of those is remembered state, and it is keyed to the private
+    chat rather than used globally: the remembered group expires, and a
+    remembered answer target is only ever consulted for a question the owner has
+    just forwarded. A question forwarded from somewhere always goes to the place
+    it came from, because the first two lookups are tried first and the fallback
+    is the owner's own most recent forward.
+    """
+    direct = _origin_chat_id(message)
+    if direct is not None:
+        return direct
+    replied = getattr(message, "reply_to_message", None)
+    if replied is not None:
+        found = _origin_chat_id(replied)
+        if found is not None:
+            return found
+    return _remembered_forward(message)[1] if _remembered_forward(message) else None
+
+
+def _remembered_forward(message: Any) -> tuple[Any, int] | None:
+    """The last question forwarded into this chat, or None if there is none."""
+    chat_key = id(getattr(message, "chat", None))
+    _expire_forward(chat_key)
+    return _last_forward.get(chat_key)
+
+
 @private_only
 async def answer_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Answer a forwarded group question in the group, not in the private chat.
@@ -1193,16 +1273,46 @@ async def answer_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     an owner's forwarded question gets the same treatment a student's would.
     """
     message = update.effective_message
-    chat_id = _forwarded_chat_id(message)
+    # The question can be on the command itself, on a message it replies to, or
+    # on the forward the owner sent a moment ago, and the bare "/a" carries
+    # nothing at all. Each falls back to the next, because which of the three the
+    # owner used is a detail of how they hold their phone, not a rule they should
+    # have to know.
+    source = message
+    chat_id = _origin_chat_id(source)
+    if chat_id is None:
+        replied = getattr(message, "reply_to_message", None)
+        if replied is not None and _origin_chat_id(replied) is not None:
+            # A reply to the forward is the instruction; the forward is the
+            # question. Reading the reply's own text is what lets "سوّ لي" next to
+            # a photo mean anything.
+            source, chat_id = replied, _origin_chat_id(replied)
+            if re.sub(r"^/(?:answer|a)\S*(?:\s+|$)", "",
+                      (replied.text or replied.caption or "").strip()).strip() == "":
+                source = getattr(replied, "reply_to_message", None) or source
+    if chat_id is None:
+        remembered = _remembered_forward(message)
+        if remembered is not None:
+            # The remembered message is the question, not the command, so a bare
+            # "/a" answers what was forwarded rather than answering itself.
+            source, chat_id = remembered
+            if not _origin_chat_id(source):
+                source = getattr(source, "reply_to_message", None) or source
     if chat_id is None:
         await message.reply_text(
-            "هذي مو رسالة محوّلة من مجموعة.\n"
-            "حوّل رسالة الطالب للخاص، وأنا بجاوبها بالمجموعة الي إجا منها.")
+            "ما لگيت رسالة محوّلة.\n"
+            "حوّل رسالة الطالب للخاص، وبعدها مباشرة اكتب /a — بجاوبها بالمجموعة الي إجا منها.")
         return
-    photo = (message.photo or [None])[-1]
-    document = message.document
-    body = (message.caption or message.text or "").strip()
+    photo = (getattr(source, "photo", None) or [None])[-1]
+    document = getattr(source, "document", None)
+    body = (getattr(source, "caption", None) or getattr(source, "text", None) or "").strip()
+    # The command word is not part of the question, whichever message it landed
+    # on, so "/a" typed next to a forward is a command and the forwarded text
+    # stays the question -- neither is sent to the model as the other.
     body = re.sub(r"^/(?:answer|a)\S*(?:\s+|$)", "", body, count=1).strip()
+    if not body and photo is None and document is None:
+        await message.reply_text("حوّل رسالة الطالب — نص أو صورة أو ملف — وأنا بجاوبها بالمجموعة.")
+        return
     if not body and photo is None and document is None:
         await message.reply_text("حوّل رسالة الطالب — نص أو صورة أو ملف — وأنا بجاوبها بالمجموعة.")
         return
@@ -1246,6 +1356,9 @@ async def answer_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     logger.info("Forwarded question answered in chat %s (%d char(s), %s)",
                 chat_id, len(body),
                 "photo" if photo is not None else "document" if document is not None else "text")
+    # The group is remembered so the next "/a" needs no forward next to it,
+    # which is what makes the two-message form -- forward, then command -- work.
+    remember_forward_chat(source, chat_id)
     await message.reply_text("جاوبتها بالمجموعة.")
 
 
