@@ -9,6 +9,7 @@ import re
 import shutil
 import threading
 import time
+import unicodedata
 import uuid
 from datetime import datetime
 from functools import wraps
@@ -438,14 +439,26 @@ def _fold(text: str) -> tuple[str, list[int]]:
     the wrong characters: in "مَرْحَبًا ليو" the two marks before the name are
     gone, the match lands two places early, and the name is left in the question
     while the greeting loses its last two letters.
+
+    A character is also normalised on its own, which is what a paste out of Word
+    or a lesson PDF needs. Such text arrives in the Arabic Presentation Forms
+    block -- U+FEDD, U+FEF1, U+FEED for the name -- where the same three letters
+    look identical to the ones a keyboard sends and are different codepoints.
+    Matching one set and not the other means the bot answers a name a student
+    typed and stays silent for the same name they pasted from the document the
+    question was written in. Normalising per character rather than per string
+    keeps the origin map exact: a ligature that expands to two letters records
+    the one index it came from twice, so cutting the original still removes the
+    whole character and not half of it.
     """
     folded: list[str] = []
     origin: list[int] = []
     for index, ch in enumerate(text):
         if ch in _IGNORED_CHARS:
             continue
-        folded.append(_LETTER_FOLD.get(ch, ch))
-        origin.append(index)
+        for piece in unicodedata.normalize("NFKC", ch):
+            folded.append(_LETTER_FOLD.get(piece, piece))
+            origin.append(index)
     return "".join(folded), origin
 
 
