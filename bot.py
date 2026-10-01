@@ -956,7 +956,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "للمدير: بعد ما تراجع المحتوى بـ /pending، اعتمده بـ /approve رقم_العنصر approved بالخاص، "
         "وبعدين /export يطلع ملف التدريب.\n\n"
         "وتنشر إعلان بالمجموعة: اكتب /post وبعدها الرسالة بالخاص، أو صوّر شي مع تعليق — "
-        "بتروح للمجموعة باسم البوت، بنفس الشكل بالضبط."
+        "بتروح للمجموعة باسم البوت، بنفس الشكل بالضبط.\n\n"
+        "وتجاوب سؤال محوّل: حوّل رسالة طالب من المجموعة للخاص واكتب /answer، "
+        "بتجاوب بالمجموعة الي إجا منها السؤال، مو بالخاص."
     )
 
 
@@ -1120,6 +1122,121 @@ async def roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     students = row["students"]
     listing = "\n".join(f"{i}. {code}" for i, code in enumerate(students, 1)) or "لا يوجد طلاب بعد."
     await update.effective_message.reply_text(f"حضور الحصة #{row['id']} — {row['title']} ({len(students)}/{row['capacity']}):\n{listing}")
+
+
+def _forwarded_chat_id(message: Any) -> int | None:
+    """The group a message was forwarded from, or None if it was not forwarded.
+
+    Telegram delivers the origin rather than a group reference, and the shape
+    differs by what the source was: a forward from another group or a channel
+    names the chat, while a forward from a person does not -- there is no group
+    to answer in, and guessing the remembered one would post a stranger's
+    question to a class that never asked.
+
+    Both the current ``forward_origin`` and the older ``forward_from_chat`` are
+    read. The newer field is what the library populates now, but the old one is
+    what a payload from an older client still carries, and the whole feature
+    fails silently without it.
+    """
+    origin = getattr(message, "forward_origin", None)
+    chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
+    if chat is not None and getattr(chat, "type", None) in {ChatType.GROUP,
+                                                            ChatType.SUPERGROUP,
+                                                            ChatType.CHANNEL}:
+        return getattr(chat, "id", None)
+    legacy = getattr(message, "forward_from_chat", None)
+    if legacy is not None and getattr(legacy, "type", None) in {ChatType.GROUP,
+                                                               ChatType.SUPERGROUP,
+                                                               ChatType.CHANNEL}:
+        return getattr(legacy, "id", None)
+    return None
+
+
+@private_only
+async def answer_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Answer a forwarded group question in the group, not in the private chat.
+
+    The owner sees a student stuck in the group while the group is busy, and
+    forwards the question here to ask about it. Answering in private would give
+    the owner the answer and leave the student -- the one who asked, and the one
+    the answer is for -- still stuck, and the answer would arrive in a place
+    nobody is reading.
+
+    The forwarded origin decides where it goes, never a remembered group, so a
+    question forwarded from anywhere lands in the place it was asked. Text,
+    photos and documents all take the same path as answering in the group, so
+    an owner's forwarded question gets the same treatment a student's would.
+    """
+    message = update.effective_message
+    chat_id = _forwarded_chat_id(message)
+    if chat_id is None:
+        await message.reply_text(
+            "هذي مو رسالة محوّلة من مجموعة.\n"
+            "حوّل رسالة الطالب للخاص، وأنا بجاوبها بالمجموعة الي إجا منها.")
+        return
+    photo = (message.photo or [None])[-1]
+    document = message.document
+    body = (message.caption or message.text or "").strip()
+    body = re.sub(r"^/(?:answer|a)\S*(?:\s+|$)", "", body, count=1).strip()
+    if not body and photo is None and document is None:
+        await message.reply_text("حوّل رسالة الطالب — نص أو صورة أو ملف — وأنا بجاوبها بالمجموعة.")
+        return
+    try:
+        await thinking_pause(message)
+        if photo is not None:
+            if photo.file_size and photo.file_size > settings.max_download_bytes:
+                await message.reply_text("الصورة أكبر من الحد المسموح، ما أگدر أجيبها.")
+                return
+            data = await _download_bytes(context, photo.file_id, settings.max_download_bytes)
+            answer = await ai.answer_image(data, "image/jpeg", body)
+            await context.bot.send_photo(chat_id, photo.file_id, caption=answer)
+        elif document is not None:
+            limit = settings.max_document_bytes
+            if document.file_size and document.file_size > limit:
+                await message.reply_text("الملف أكبر من الحد المسموح، ما أگدر أجيبه.")
+                return
+            data = await _download_bytes(context, document.file_id, limit)
+            mime = getattr(document, "mime_type", None) or "application/octet-stream"
+            answer = await ai.answer_file(data, mime, body)
+            await context.bot.send_document(chat_id, document.file_id, caption=answer)
+        else:
+            answer = await ai.answer_text(body)
+            # Split for the same reason as every other send: the limit is a
+            # property of the message, not of who asked for the answer.
+            for chunk in _chunks(answer):
+                await context.bot.send_message(chat_id, chunk)
+    except Forbidden:
+        await message.reply_text("ما أگدر أرسل بالمجموعة — تأكد البوت لسه فيها وصلاحية إرسال.")
+        return
+    except GeminiQuotaError:
+        await message.reply_text("ماكو حصة على Gemini. جرّب بعد شوي.")
+        return
+    except GeminiUnavailableError:
+        await message.reply_text("كل النماذج مشغولة هسه. جرّب بعد شوي.")
+        return
+    except Exception as exc:
+        logger.exception("Forwarded answer to %s failed", chat_id)
+        await message.reply_text(f"صار خطأ: {type(exc).__name__}")
+        return
+    logger.info("Forwarded question answered in chat %s (%d char(s), %s)",
+                chat_id, len(body),
+                "photo" if photo is not None else "document" if document is not None else "text")
+    await message.reply_text("جاوبتها بالمجموعة.")
+
+
+async def _download_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str,
+                          limit: int) -> bytes:
+    """Fetch a file into memory, refusing anything over the limit.
+
+    Read into memory rather than to disk because these bytes go straight to the
+    model: a forwarded question is not a lesson to keep, and the image handlers
+    write to the dataset on purpose while this path deliberately does not.
+    """
+    telegram_file = await context.bot.get_file(file_id)
+    data = bytes(await telegram_file.download_as_bytearray())
+    if len(data) > limit:
+        raise ValueError("forwarded file over the limit")
+    return data
 
 
 @private_only
@@ -2057,6 +2174,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("quiz", quiz))
     application.add_handler(CommandHandler("progress", progress))
     application.add_handler(CommandHandler("post", post))
+    application.add_handler(CommandHandler("answer", answer_forwarded))
+    application.add_handler(CommandHandler("a", answer_forwarded))
     application.add_handler(CallbackQueryHandler(quiz_topic_picked, pattern=r"^qtopic:"))
     application.add_handler(CallbackQueryHandler(quiz_answered, pattern=r"^qa:"))
     application.add_handler(CallbackQueryHandler(private_consent_answered,
