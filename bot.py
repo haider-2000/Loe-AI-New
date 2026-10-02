@@ -2715,6 +2715,34 @@ async def check_group_privacy_mode(bot_api) -> bool | None:
     return reads_all_group_messages
 
 
+# The loops that outlive a single update are owned here rather than by
+# Application.create_task(). post_init runs while the application is still
+# booting, and PTB warns there that such tasks are never awaited and never
+# cancelled: the container is killed mid-loop and every pending task is
+# reported as "Task was destroyed but it is pending", which is indistinguishable
+# from a bot that has stopped polling. Holding the handles lets post_shutdown
+# end them in order instead of dropping them on the floor.
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def spawn_background(coroutine: Any) -> asyncio.Task[Any]:
+    """Run a long-lived coroutine on PTB's loop and remember it for shutdown."""
+    task = asyncio.get_running_loop().create_task(coroutine)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
+async def stop_background(_: Application) -> None:
+    """Cancel and await every loop we started, so none is destroyed pending."""
+    tasks = list(_BACKGROUND_TASKS)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _BACKGROUND_TASKS.clear()
+
+
 async def post_init(application: Application) -> None:
     global database_is_remote
     for directory in ("data/raw/images", "data/raw/text", "data/raw/documents", "data/exports",
@@ -2744,12 +2772,12 @@ async def post_init(application: Application) -> None:
         # A group that goes quiet after its last message is the one whose tally
         # we most need, so the counters are written on a timer and not only
         # when the next message happens to arrive.
-        application.create_task(routing_flush_loop())
+        spawn_background(routing_flush_loop())
     if health_port:
-        application.create_task(keep_awake(health_port))
+        spawn_background(keep_awake(health_port))
     minutes = int(os.getenv("AUTO_BACKUP_MINUTES", "0") or 0)
     if minutes > 0:
-        application.create_task(auto_backup_loop(application.bot, minutes))
+        spawn_background(auto_backup_loop(application.bot, minutes))
         logger.info("Automatic backup every %d minute(s) to the admin's private chat", minutes)
 
 
@@ -2757,8 +2785,9 @@ def build_application() -> Application:
     application = (Application.builder()
                    .token(settings.telegram_bot_token)
                    .concurrent_updates(True)
-                   .post_init(post_init)
-                   .build())
+.post_init(post_init)
+                    .post_shutdown(stop_background)
+                    .build())
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("privacy", privacy))
@@ -2831,9 +2860,9 @@ def main() -> None:
     ai = GeminiClient(settings.gemini_api_key, settings.gemini_model)
     # Built only when the key is there, on its own model and its own client, so
     # the traffic the gate generates cannot spend the quota the answers need.
-    # Unset is not an error: the bot then answers only when it is named, which
-    # is what it always did, and /status says the gate is off so nobody goes
-    # looking for a bug that is a missing environment variable.
+    # Unset is not an error and not a quieter bot: every message still gets an
+    # answer, this one without the gate's second opinion, and /status says the
+    # gate is off so nobody goes looking for a bug that is a missing key.
     if settings.router_api_key:
         router = GeminiClient(settings.router_api_key, settings.router_model)
     else:
