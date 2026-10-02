@@ -262,6 +262,11 @@ Rules:
 - For maths, show the steps briefly and end with the final answer.
 - For images, read handwritten or printed educational content and answer it. For voice, transcribe and answer, but never mention storing audio.
 - Plain text only: no markdown, no asterisks, no bold, no headings, no bullet symbols.
+- When the answer itself carries a reaction, end with that one emoji and nothing
+  else after it: 🧠 for something done well or understood, ❌ for a wrong answer or
+  a misconception. One emoji, at the very end, only where it belongs, and never on
+  a plain factual answer that needs none. The bot sends the matching sticker from
+  its own pack after your reply, so the emoji is what chooses it.
 - No personal-data commentary."""
 
 # The part of the persona that must survive even when the tutor voice is

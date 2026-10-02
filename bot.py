@@ -1267,6 +1267,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @private_only
 @admin_only
+async def pack_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Load a whole Telegram sticker pack into the library.
+
+    The bot cannot copy a file_id from anywhere and cannot sign in as the owner, so
+    the pack is read out of Telegram itself: getStickerSet on its short name hands
+    back every sticker with an id that is valid for this bot and does not expire.
+    Fetching it once is enough, which is why the ids are stored on disk instead of
+    being asked for on every reply.
+
+    Only the emoji each sticker wears is kept with it, and that is the whole
+    trick: it is the only description of the sticker that already exists, so the
+    bot can match the face Leo himself used in his answer without the owner
+    labelling 120 stickers by hand.
+    """
+    message = update.effective_message
+    raw = message.text or message.caption or ""
+    matched = PACK_COMMAND_RE.match(raw)
+    asked = (raw[matched.end():] if matched else " ".join(context.args or [])).strip()
+    if not asked:
+        loaded = stickers.pack_names(STICKER_LIBRARY_PATH)
+        body = (f"محّلة حالياً: {chr(10).join(loaded)}" if loaded
+                else "ماكو حزم محمّلة بعد.")
+        if stickers.DEFAULT_PACK not in loaded:
+            body += f"\n\nأكتب /pack {stickers.DEFAULT_PACK} أحمّل حزمتك."
+        await message.reply_text(
+            "أكتب اسم الحزمة كما ظاهر بالآخر: /pack <الاسم>\n"
+            f"مثال: افتح أي ملصق واضغط اسم الحزمة، ونسخه.\n\n{body}")
+        return
+    name = asked.split()[0].lstrip("@")
+    try:
+        pack = await context.bot.get_sticker_set(name)
+    except BadRequest as exc:
+        await message.reply_text(f"ما لگيت حزمة بهذا الاسم «{name}».")
+        logger.info("Sticker pack %s not found: %s", name, exc)
+        return
+    entries = [{"file_id": s.file_id, "emoji": s.emoji or ""} for s in pack.stickers]
+    kept = stickers.save_pack(pack.name, pack.title, entries, STICKER_LIBRARY_PATH)
+    await message.reply_text(
+        f"حمّلت «{pack.title}» — {kept} ملصق.\n"
+        "راح أبعث الملصق الي بنفس الإيموجي الي أكتبه بالجواب.")
+
+
+@private_only
+@admin_only
 async def sticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Teach the bot a sticker: send one here, name it, and it can answer with it.
 
@@ -1280,7 +1324,7 @@ async def sticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     tags = "، ".join(sorted(stickers.MOODS))
     if sticker is None:
         await message.reply_text(
-            "دزلي ملصق هنا وسجله.\n"
+            "دزلي ملصق هنا وسجله، أو حمّل حزمة كاملة بـ /pack.\n"
             f"الاسم وحدة من هالأسماء: {tags}\n"
             "مثال: ترسل الملصق وبعده /sticker ضحك.")
         return
@@ -1318,11 +1362,15 @@ async def maybe_send_sticker(message, answer: str) -> bool:
     chat_id = getattr(getattr(message, "chat", None), "id", None)
     if chat_id is None:
         return False
-    file_id = stickers.pick(answer, chat_id, STICKER_LIBRARY_PATH)
-    if not file_id:
+    entry = stickers.pick(answer, chat_id, STICKER_LIBRARY_PATH)
+    if not entry:
         return False
+    # Telegram takes a file_id string, not the stored entry; the emoji comes along
+    # only because a video sticker will not send without one.
+    file_id, face = entry["file_id"], entry.get("emoji") or None
     try:
-        remember_sent(chat_id, await message.get_bot().send_sticker(chat_id, file_id))
+        remember_sent(chat_id, await message.get_bot().send_sticker(chat_id, file_id,
+                                                                    emoji=face))
         return True
     except RetryAfter:
         logger.warning("Rate limited sending a sticker; skipping it")
@@ -1771,6 +1819,11 @@ QUOTED_COMMAND_RE = re.compile(
 # build a CommandHandler for either of them.
 STICKER_COMMAND_RE = re.compile(
     r"^/(?:sticker|ستيكر|ملصق)(?![\wء-ي])(?:\s+|$)", re.UNICODE)
+
+# Loading a whole pack is the same story for the same reason: "حزمة" is the word the
+# owner will type, and PTB will not build a CommandHandler for it.
+PACK_COMMAND_RE = re.compile(
+    r"^/(?:pack|packset|حزمة|حزم|مجموعة)(?![\wء-ي])(?:\s+|$)", re.UNICODE)
 
 
 @allowed_chat_only
@@ -2969,9 +3022,15 @@ async def post_init(application: Application) -> None:
     if health_port:
         spawn_background(keep_awake(health_port))
     minutes = int(os.getenv("AUTO_BACKUP_MINUTES", "0") or 0)
-    if minutes > 0:
+    if minutes > 0 and application is not None:
         spawn_background(auto_backup_loop(application.bot, minutes))
-        logger.info("Automatic backup every %d minute(s) to the admin's private chat", minutes)
+        logger.info("Automatic backup every %d minute(s) to the admin's private chat",
+                    minutes)
+    if application is not None:
+        # The bot's own sticker pack, fetched once per deploy rather than on the
+        # first reply, so adding a sticker needs no command and no reminder after.
+        spawn_background(stickers.ensure_default_pack(application.bot,
+                                                      STICKER_LIBRARY_PATH))
 
 
 def build_application() -> Application:
@@ -3005,6 +3064,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("a", answer_forwarded))
     application.add_handler(MessageHandler(filters.Regex(STICKER_COMMAND_RE),
                                            sticker_command))
+    application.add_handler(MessageHandler(filters.Regex(PACK_COMMAND_RE),
+                                           pack_command))
     # Ask about the message you replied to. Registered as a plain message handler
     # on a regex, not a CommandHandler: Telegram command names are restricted to
     # a-z0-9_ and PTB refuses to build one for "سؤال", and the word students
