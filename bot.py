@@ -673,7 +673,8 @@ _SHAPE_WORDS = {
 def _routing_note(chat_id: int) -> dict[str, Any]:
     return _ROUTING_NOTES.setdefault(
         chat_id, {"seen": 0, "name": 0, "mention": 0, "reply": 0, "gate": 0,
-                  "no": 0, "last": None, "at": 0, "recent": []})
+                  "gate-soft-no": 0, "no": 0, "last": None, "at": 0,
+                  "recent": []})
 
 
 # Which way in this message used, in words a student can act on.
@@ -682,7 +683,8 @@ _WHY_WORDS = {
     "mention": "✔️ عرفها: منشنك",
     "reply": "✔️ عرفها: رد على رسالتي",
     "gate": "✔️ عرفها: البوابة قرأت إنها سؤال للمعلّم",
-    "no": "🚫 ما عرفها — لازم اسمك أول الكابشن",
+    "gate-soft-no": "⚠️ البوابة ماگالت إنها إله — ردّيت على كل حال",
+    "no": "✔️ ما فيها اسمك، وردت على كل شي",
 }
 
 
@@ -867,32 +869,50 @@ def routing_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
 
 
 async def should_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Whether this message is for the bot: named, mentioned, replied to, or about him.
+    """Whether this message is for the bot. In a group: always yes, except bots.
 
-    The name, the @handle and the reply are free and certain, so they are
-    answered first and the gate is never asked about them. Only a message that
-    arrived at nothing -- the one case the bot previously dropped -- reaches the
-    gate, which reads the surrounding lines and decides whether this is a
-    question the class is waiting on an answer to.
+    This used to be a decision, and it went wrong in a way that could not be seen
+    from the outside. The owner asked for a tutor that engages with everything,
+    and the count in the database said the gate had been consulted zero times in
+    eight messages: every message that arrived had been dropped earlier, by the
+    rules that only answered a name or a reply to the bot. So the gate was
+    working and simply never reached. Widening it was not enough, because a
+    message like "ليو شلونك" is answered by the name path in under a millisecond
+    and never asks a model anything -- which is right, and also means the quiet
+    could never be fixed from the gate alone.
 
-    The gate is asked once per message and its verdict is counted as the routing
-    reason, so /status shows "the bot answered because the gate read it as a
-    question" separately from a name in the caption. That separation is the point
-    of the feature: once the bot starts answering unaddressed messages, a group
-    that stops is either a gate that says no or a gate that is not running, and
-    those look identical without the count.
+    So the gate is now advisory rather than final. It runs on a message that
+    arrived at nothing, so its verdict is still counted under "gate" and /status
+    can show it, but a "no" no longer silences the room. The bot reads what the
+    group says and answers; the prompt tells it when to keep quiet of its own
+    accord, in a single short line, rather than dropping the message on the floor
+    where nobody sees the decision being made.
+
+    One exclusion survives, and it has to be here rather than in the gate: another
+    bot's message. A class group runs bots, and "answer everything" taken
+    literally would mean answering all of them, forever, in a loop that costs
+    quota on both sides and reads as a malfunction to the class. A student is
+    never excluded; a machine is.
     """
+    message = update.effective_message
+    if message is not None and getattr(
+            getattr(message, "from_user", None), "is_bot", False):
+        logger.info("Ignoring a message from another bot")
+        return False
     reason, chat_id = _judge(update, context)
     if reason != "no":
         if chat_id is not None:
             note_routing(chat_id, reason)
         return True
     if chat_id is not None:
+        # Asked anyway, so the count and the log show what the gate thought, and
+        # so turning it off later is a one-line change rather than a dig. The
+        # verdict no longer decides anything.
         if await gate_reads_it_as_a_question(update, chat_id):
             note_routing(chat_id, "gate")
-            return True
-        note_routing(chat_id, "no")
-    return False
+        else:
+            note_routing(chat_id, "gate-soft-no")
+    return True
 
 
 def _judge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, int | None]:
@@ -908,6 +928,32 @@ def _judge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, int
     return reason, chat.id
 
 
+def _addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Whether the student aimed this message at the bot, ignoring the gate.
+
+    Answering a message and keeping it are two different decisions, and the gap
+    between them only became visible once the bot started answering everything.
+    The dataset is the owner's record of questions and the model's answers, and it
+    is what the fine-tune is built from, so a message the student did not ask the
+    bot is not a training example of anything. In a busy group that is now the
+    majority of what arrives, and storing it would bury the real questions under a
+    class's small talk -- so it would be worse, not merely noisier.
+
+    So a message only joins the dataset when it was actually addressed: named,
+    mentioned, or a reply to the bot. It is still answered, still remembered in
+    the conversation, and still costs the same quota. The archive is the only
+    thing that needs the student's words to have been aimed at us.
+
+    This is the single place that distinction is made, and every handler that
+    writes to the dataset asks here rather than re-deciding it for itself. The
+    gate is deliberately not consulted: by the time anything reaches the archive
+    the gate is advisory, and letting it in here would put a stranger's opinion
+    back in charge of what is kept.
+    """
+    reason, _ = _judge(update, context)
+    return reason != "no"
+
+
 async def gate_reads_it_as_a_question(update: Update, chat_id: int) -> bool:
     """Ask the separate-key gate whether this message is meant for the bot.
 
@@ -918,8 +964,11 @@ async def gate_reads_it_as_a_question(update: Update, chat_id: int) -> bool:
 
     Every failure answers no. A missing key, a busy model, a refused call or a
     verdict that is neither yes nor no all mean the same thing, and it is the
-    thing that was true before this existed: the bot does not answer messages
-    that did not name it.
+    thing that was true before this existed. What changed afterwards is not the
+    gate but what a no is worth: it is recorded and printed in /status, and it no
+    longer decides whether the student gets an answer. The counter is the point,
+    not the veto -- a gate whose opinion is never recorded is indistinguishable
+    from a gate that is not running.
     """
     if router is None:
         return False
@@ -1335,7 +1384,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             # that reached a handler and was turned away, and the gap between
             # the two figures is the only place that difference shows.
             seen = note.get("seen", 0)
-            judged = sum(note.get(k, 0) for k in ("name", "mention", "reply", "gate", "no"))
+            judged = sum(note.get(k, 0) for k in
+                         ("name", "mention", "reply", "gate", "gate-soft-no", "no"))
             unhandled = seen - judged
             if unhandled:
                 note["unhandled"] = unhandled
@@ -1346,7 +1396,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                      f"📊 وصلني: {seen} رسالة · "
                      f"اسم: {note.get('name', 0)} · منشن: {note.get('mention', 0)} · "
                      f"رد: {note.get('reply', 0)} · "
-                     f"بوابة: {note.get('gate', 0)} · متجاهلة: {note.get('no', 0)}\n"
+                     f"بوابة: {note.get('gate', 0)} · "
+                     f"البوابة ماگالت: {note.get('gate-soft-no', 0)}\n"
                      + (f"🚶 {unhandled} وصلت وما وصلها هاندلر أصلاً\n" if unhandled else "")
                      + (f"📤 ردت: {note.get('sent', 0)} · فشل: {note.get('failed', 0)}\n"
                         if ("sent" in note or "failed" in note) else "")
@@ -2086,6 +2137,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     caption = message.caption or ""
     question = clean_prompt(caption, context.bot.username or "") or "اشرحلي الملف هذا."
     key = thread_key(update)
+    # A worksheet posted with no caption is answered but not kept; see _addressed.
+    keep = _addressed(update, context)
     try:
         telegram_file = await context.bot.get_file(document.file_id)
         data = bytes(await telegram_file.download_as_bytearray())
@@ -2098,7 +2151,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             memory.remember(*key, question, answer)
         # Stored as text: the PII scan on the text is what keeps a document
         # full of names and phone numbers out of any export.
-        await save_text(settings.database_path, question, answer, "data/raw/documents")
+        if keep:
+            await save_text(settings.database_path, question, answer, "data/raw/documents")
         await reply_answer(message, answer)
     except GeminiQuotaError:
         logger.error("No quota for any model while reading a %s", mime)
@@ -2131,13 +2185,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await reply_answer(message, WAKE_UP_MESSAGE)
         return
     key = thread_key(update)
+    # Answering everything does not mean archiving everything; see _addressed.
+    keep = _addressed(update, context)
     try:
         history = memory.recent(*key) if key else []
         await thinking_pause(message)
         answer = await ai.answer_text(text, history=history)
         if key:
             memory.remember(*key, text, answer)
-        await save_text(settings.database_path, text, answer, "data/raw/text")
+        if keep:
+            await save_text(settings.database_path, text, answer, "data/raw/text")
         await reply_answer(message, answer)
     except GeminiQuotaError:
         logger.error("No quota for any model; the account needs billing")
@@ -2167,6 +2224,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     image_dir.mkdir(parents=True, exist_ok=True)
     local_path = image_dir / f"{uuid.uuid4().hex}.jpg"
     key = thread_key(update)
+    # A photo posted with no caption is answered but not kept; see _addressed.
+    keep = _addressed(update, context)
     try:
         telegram_file = await context.bot.get_file(photo.file_id)
         await telegram_file.download_to_drive(custom_path=str(local_path))
@@ -2180,15 +2239,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                                        history=history)
         if key:
             memory.remember(*key, asked, answer)
-        visual_pii = await ai.image_has_obvious_pii(data, "image/jpeg")
-        saved = await save_image(settings.database_path, str(local_path), message.caption or "",
-                                 answer, dedupe_key=hashlib.sha256(data).hexdigest())
-        if not saved:
-            # Identical content is already on file; drop the redundant download.
+        if keep:
+            # The PII scan is the reason an image can be kept at all, so it is
+            # only worth the call when the image is going to be kept.
+            visual_pii = await ai.image_has_obvious_pii(data, "image/jpeg")
+            saved = await save_image(settings.database_path, str(local_path),
+                                     message.caption or "", answer,
+                                     dedupe_key=hashlib.sha256(data).hexdigest())
+            if not saved:
+                # Identical content is already on file; drop the redundant download.
+                local_path.unlink(missing_ok=True)
+            elif visual_pii:
+                # Keep the image available for internal review, but prevent export.
+                await set_privacy_flag(settings.database_path, str(local_path))
+        else:
+            # Not addressed, so the answer is not an example and the picture is
+            # not part of the record. It had to be downloaded to be read, and the
+            # copy on disk is deleted rather than left behind for a later export
+            # to find -- the same picture would otherwise sit in data/raw/images
+            # with no row pointing at it.
+            saved = False
             local_path.unlink(missing_ok=True)
-        elif visual_pii:
-            # Keep the image available for internal review, but prevent export.
-            await set_privacy_flag(settings.database_path, str(local_path))
         if saved and database_is_remote:
             # The disk is wiped on every restart, so on a remote database the
             # bytes have to live in the database too, or the stored row ends up
@@ -2228,6 +2299,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     audio_bytes = b""
     key = thread_key(update)
+    # A voice note sent to nobody in particular is answered but not kept; see
+    # _addressed.
+    keep = _addressed(update, context)
     try:
         telegram_file = await context.bot.get_file(voice.file_id)
         audio_bytes = await telegram_file.download_as_bytearray()
@@ -2238,7 +2312,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                                                       history=history)
         if key:
             memory.remember(*key, transcription or "[رسالة صوتية]", answer)
-        await save_voice_transcription(settings.database_path, transcription, answer)
+        if keep:
+            await save_voice_transcription(settings.database_path, transcription, answer)
         await reply_answer(message, answer)
     except GeminiQuotaError:
         logger.error("No quota for any model while handling a voice note")
