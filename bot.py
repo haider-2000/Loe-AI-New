@@ -35,6 +35,7 @@ from database import (all_rows, count_by_status, create_lesson, create_quiz_sess
 from dataset import export_dataset, save_image, save_text, save_voice_transcription
 from gemini_client import GeminiClient, GeminiQuotaError, GeminiUnavailableError
 from memory import ConversationMemory
+import stickers
 
 BUSY_MESSAGE = "الخدمة مشغولة حالياً لأن ضغط الطلبات عالية. حاول بعد دقيقة."
 
@@ -1264,6 +1265,76 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@private_only
+@admin_only
+async def sticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Teach the bot a sticker: send one here, name it, and it can answer with it.
+
+    A sticker file_id only works for a bot that has the sticker in its own set, so
+    there is nothing to fetch or guess -- the owner hands them over. Naming it is
+    the part that matters: the tags are moods, and the bot decides by looking for
+    that mood in the answer it already wrote, not by asking a model.
+    """
+    message = update.effective_message
+    sticker = getattr(message, "sticker", None)
+    tags = "، ".join(sorted(stickers.MOODS))
+    if sticker is None:
+        await message.reply_text(
+            "دزلي ملصق هنا وسجله.\n"
+            f"الاسم وحدة من هالأسماء: {tags}\n"
+            "مثال: ترسل الملصق وبعده /sticker ضحك.")
+        return
+    raw = message.text or message.caption or ""
+    matched = STICKER_COMMAND_RE.match(raw)
+    asked = (raw[matched.end():] if matched else " ".join(context.args or [])).strip()
+    if not asked:
+        await message.reply_text(
+            f"شو اسم هالملصق؟ وحدة من: {tags}\nمثال: /sticker ضحك")
+        return
+    tag = asked
+    if tag not in stickers.MOODS:
+        await message.reply_text(f"ما أعرف الوسم «{tag}». استخدم وحدة من: {tags}")
+        return
+    file_id = getattr(sticker, "file_id", None)
+    if not file_id:
+        await message.reply_text("ما أگدر أقرا هالملصق، جرّب وحد ثاني.")
+        return
+    stickers.remember(tag, file_id, STICKER_LIBRARY_PATH)
+    await message.reply_text(
+        f"سجلت «{tag}». راح أبعثه لمّا الجواب يناسبه، ومو كل رسالة.")
+
+
+# Stickers the owner registered, next to the database rather than inside it.
+STICKER_LIBRARY_PATH = Path("data/stickers.json")
+
+
+async def maybe_send_sticker(message, answer: str) -> bool:
+    """Add one sticker when the answer's own words call for one.
+
+    Nothing here talks to the model: the sticker is chosen by finding a mood word
+    in what Leo already wrote, so a wrong pick can only ever be a slightly odd
+    reaction, and the model cannot waste sends by asking for stickers.
+    """
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    if chat_id is None:
+        return False
+    file_id = stickers.pick(answer, chat_id, STICKER_LIBRARY_PATH)
+    if not file_id:
+        return False
+    try:
+        remember_sent(chat_id, await message.get_bot().send_sticker(chat_id, file_id))
+        return True
+    except RetryAfter:
+        logger.warning("Rate limited sending a sticker; skipping it")
+    except (BadRequest, Forbidden):
+        # A sticker the owner registered long ago can stop being usable, and a
+        # failed reaction must never cost the answer it was following.
+        logger.warning("Sticker %s could not be sent", file_id)
+    except Exception:
+        logger.exception("Sticker send failed")
+    return False
+
+
 @allowed_chat_only
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Stated from the live state of the gate rather than written once, because the
@@ -1283,6 +1354,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "النتائج تنحفظ لكل طالب لحاله وتگدر تشوفها بـ /progress.\n\n"
         "و anyone يگدر يسكّت البوت بهالمحادثة بـ/pause، ويرجع يرد أول ما أحد من هنا يرسل /start.\n\n"
         "أگدر تقرا برضو ملفات PDF و GIF والمقاطع القصيرة، دزها مثل أي سؤال.\n\n"
+        "وإذا تريدني أجاوب عن رسالة معيّنة، ترد عليها وتكتب /سؤال وسؤالك (أو /سؤال لحاله يعني اشرح الرسالة الي ردّيت عليها).\n\n"
         "أتذكر آخر ٥ أسئلة وجواباتها منك فقط (لكل مجموعة على حدة) عشان تكمل بنفس الموضوع. "
         "هذه الذاكرة مؤقتة بالجهاز وما تنحفظ بالداتابيز، وبتقدر تمسحها بـ /forget.\n\n"
         "تنظيم الحصص (للمدير):\n/newlesson العنوان | التاريخ | الوقت | السعة\n"
@@ -1682,6 +1754,126 @@ async def _download_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str,
     if len(data) > limit:
         raise ValueError("forwarded file over the limit")
     return data
+
+
+# The words that ask Leo about the message a student replied to. Telegram command
+# names may only contain a-z0-9_ and PTB refuses to build a handler for anything
+# else, so this is matched with a regex on a plain message handler instead of a
+# CommandHandler. Both spellings are here because an Arabic keyboard turns one into
+# the other by habit, and neither is the "right" one to expect from a student.
+QUOTED_COMMANDS = ("سؤال", "اسأل", "ask")
+QUOTED_COMMAND_RE = re.compile(
+    r"^/(?:" + "|".join(re.escape(word) for word in QUOTED_COMMANDS) + r")(?![\wء-ي])(?:\s+|$)",
+    re.UNICODE)
+
+# The same restriction is why the owner-facing sticker command is matched here too:
+# "ستيكر" and "ملصق" are the words the owner will actually type, and PTB will not
+# build a CommandHandler for either of them.
+STICKER_COMMAND_RE = re.compile(
+    r"^/(?:sticker|ستيكر|ملصق)(?![\wء-ي])(?:\s+|$)", re.UNICODE)
+
+
+@allowed_chat_only
+@active_only
+async def answer_quoted(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Answer the message this one replies to, as a question of the asker's own.
+
+    Answering everything solved the silence and created a different problem: in a
+    busy group every reply carries an answer, so a student who wants to ask about
+    someone else's question has nowhere to put the question except a new message
+    that repeats what is already on screen. That is also the shape that most often
+    got no answer, because the new message is not addressed to anybody in
+    particular.
+
+    So this is the explicit form of the same request: reply to the message, type
+    the command, and the bot answers about that message instead of about the
+    words in the command. The quoted message is the subject, whatever it is -- text,
+    a caption, a photo, a document or a voice note -- and whatever follows the
+    command is the question about it. Both are needed: with the command alone there
+    is nothing to ask about, and with the message alone there is no question.
+    """
+    message = update.effective_message
+    # filters.COMMAND does not match an Arabic command, so context.args is empty
+    # here and the question has to be read out of the message by hand.
+    raw = message.text or message.caption or ""
+    matched = QUOTED_COMMAND_RE.match(raw)
+    asked = (raw[matched.end():] if matched else raw).strip()
+    quoted = getattr(message, "reply_to_message", None)
+    if quoted is None:
+        await message.reply_text(
+            "رد على الرسالة الي تريدني أجاوب عنها، وبعدها اكتب الأمر وسؤالك.\n"
+            "مثلاً: ترد على سؤال زميلك وتكتب: /سؤال اشرح لي الفكرة بشكل أبسط.")
+        return
+    photo = (getattr(quoted, "photo", None) or [None])[-1]
+    document = getattr(quoted, "document", None)
+    voice = getattr(quoted, "voice", None)
+    quoted_body = (getattr(quoted, "caption", None)
+                   or getattr(quoted, "text", None) or "").strip()
+    if not asked and not quoted_body and photo is None and document is None and voice is None:
+        await message.reply_text("الرسالة الي ردت عليها فاضية. اكتب سؤالك ولّا ترد على رسالة فيها شي.")
+        return
+    try:
+        await thinking_pause(message)
+        if asked and quoted_body:
+            question = f"{asked}\n\nهذي الرسالة الي ردّت عليها:\n{quoted_body}"
+        elif asked:
+            question = asked
+        else:
+            question = quoted_body
+        if photo is not None:
+            if photo.file_size and photo.file_size > settings.max_download_bytes:
+                await message.reply_text("الصورة أكبر من الحد المسموح، ما أگدر أجيبها.")
+                return
+            data = await _download_bytes(context, photo.file_id, settings.max_download_bytes)
+            answer = await ai.answer_image(data, "image/jpeg", question)
+            remember_sent(update.effective_chat.id,
+                          await context.bot.send_photo(update.effective_chat.id,
+                                                       photo.file_id, caption=answer))
+            note_outcome(update.effective_chat.id, True)
+        elif document is not None:
+            limit = settings.max_document_bytes
+            if document.file_size and document.file_size > limit:
+                await message.reply_text("الملف أكبر من الحد المسموح، ما أگدر أجيبه.")
+                return
+            data = await _download_bytes(context, document.file_id, limit)
+            mime = getattr(document, "mime_type", None) or "application/octet-stream"
+            answer = await ai.answer_file(data, mime, question)
+            remember_sent(update.effective_chat.id,
+                          await context.bot.send_document(update.effective_chat.id,
+                                                           document.file_id, caption=answer))
+            note_outcome(update.effective_chat.id, True)
+        elif voice is not None:
+            limit = settings.max_download_bytes
+            data = await _download_bytes(context, voice.file_id, limit)
+            answer = await ai.answer_voice(
+                data, voice.mime_type or "audio/ogg",
+                question or "شرّح هذا التسجيل بالتفصيل.")
+            await reply_answer(message, answer)
+        else:
+            answer = await ai.answer_text(question)
+            await reply_answer(message, answer)
+    except Forbidden:
+        await message.reply_text("ما أگدر أرسل بالمجموعة — تأكد البوت لسه فيها وصلاحية إرسال.")
+        return
+    except GeminiQuotaError:
+        await message.reply_text("ماكو حصة على Gemini. جرّب بعد شوي.")
+        return
+    except GeminiUnavailableError:
+        await message.reply_text("كل النماذج مشغولة هسه. جرّب بعد شوي.")
+        return
+    except Exception as exc:
+        logger.exception("Quoted answer in %s failed", update.effective_chat.id)
+        await message.reply_text(f"صار خطأ: {type(exc).__name__}")
+        return
+    # The student aimed the bot at this message, so it is a real question and
+    # belongs in the dataset; see _addressed for why that is not automatic.
+    if asked:
+        await save_text(settings.database_path, question, answer, "data/raw/text")
+    await maybe_send_sticker(message, answer)
+    logger.info("Answered a quoted message in %s (%s)", update.effective_chat.id,
+                "photo" if photo is not None else
+                "document" if document is not None else
+                "voice" if voice is not None else "text")
 
 
 def _split_target(body: str) -> tuple[int | str | None, str]:
@@ -2196,6 +2388,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if keep:
             await save_text(settings.database_path, text, answer, "data/raw/text")
         await reply_answer(message, answer)
+        await maybe_send_sticker(message, answer)
     except GeminiQuotaError:
         logger.error("No quota for any model; the account needs billing")
         note_outcome(chat_id, False, "no Gemini quota")
@@ -2810,6 +3003,18 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("post", post))
     application.add_handler(CommandHandler("answer", answer_forwarded))
     application.add_handler(CommandHandler("a", answer_forwarded))
+    application.add_handler(MessageHandler(filters.Regex(STICKER_COMMAND_RE),
+                                           sticker_command))
+    # Ask about the message you replied to. Registered as a plain message handler
+    # on a regex, not a CommandHandler: Telegram command names are restricted to
+    # a-z0-9_ and PTB refuses to build one for "سؤال", and the word students
+    # actually type has to be Arabic. Several spellings of it, because an Arabic
+    # keyboard makes "سؤال" and "اسأل" a different habit each. It sits above the
+    # generic text handler on purpose: filters.COMMAND does not recognise these
+    # words, so without this the text handler would answer "/سؤال ..." as a
+    # message and the quoted question would be lost.
+    application.add_handler(MessageHandler(filters.Regex(QUOTED_COMMAND_RE),
+                                           answer_quoted))
     application.add_handler(CommandHandler("group", show_announce_group))
     # "del" and the full word, because both are what people try first and a
     # command that exists under one name and not the other reads as a bug.
