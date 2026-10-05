@@ -1842,8 +1842,13 @@ async def answer_quoted(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     the command, and the bot answers about that message instead of about the
     words in the command. The quoted message is the subject, whatever it is -- text,
     a caption, a photo, a document or a voice note -- and whatever follows the
-    command is the question about it. Both are needed: with the command alone there
-    is nothing to ask about, and with the message alone there is no question.
+    command is the question about it.
+
+    The quote is context and not a condition. "The message I replied to, if there
+    is one" is what was actually asked for, so a student who typed a real question
+    gets it answered with or without something on screen to point at. Refusing a
+    typed question because no message was quoted would turn the one command that
+    always reaches the bot into another way for it to stay quiet.
     """
     message = update.effective_message
     # filters.COMMAND does not match an Arabic command, so context.args is empty
@@ -1852,17 +1857,22 @@ async def answer_quoted(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     matched = QUOTED_COMMAND_RE.match(raw)
     asked = (raw[matched.end():] if matched else raw).strip()
     quoted = getattr(message, "reply_to_message", None)
-    if quoted is None:
+    # "Based on the message I replied to, if there is one" -- so the reply is
+    # context, not a requirement. A student who typed a real question gets it
+    # answered whether or not they had something on screen to point at; only a
+    # bare command with nothing quoted and nothing typed has nothing to work on.
+    if quoted is None and not asked:
         await message.reply_text(
-            "رد على الرسالة الي تريدني أجاوب عنها، وبعدها اكتب الأمر وسؤالك.\n"
-            "مثلاً: ترد على سؤال زميلك وتكتب: /سؤال اشرح لي الفكرة بشكل أبسط.")
+            "رد على الرسالة الي تريدني أجاوب عنها، أو اكتب سؤالك بعد الأمر.\n"
+            "مثال: ترد على سؤال زميلك وتكتب: /سؤال اشرح لي الفكرة بشكل أبسط.")
         return
-    photo = (getattr(quoted, "photo", None) or [None])[-1]
-    document = getattr(quoted, "document", None)
-    voice = getattr(quoted, "voice", None)
-    quoted_body = (getattr(quoted, "caption", None)
-                   or getattr(quoted, "text", None) or "").strip()
-    if not asked and not quoted_body and photo is None and document is None and voice is None:
+    photo = (getattr(quoted, "photo", None) or [None])[-1] if quoted else None
+    document = getattr(quoted, "document", None) if quoted else None
+    voice = getattr(quoted, "voice", None) if quoted else None
+    quoted_body = ((getattr(quoted, "caption", None)
+                    or getattr(quoted, "text", None) or "").strip()
+                   if quoted else "")
+    if quoted is not None and not asked and not quoted_body and photo is None and document is None and voice is None:
         await message.reply_text("الرسالة الي ردت عليها فاضية. اكتب سؤالك ولّا ترد على رسالة فيها شي.")
         return
     try:
