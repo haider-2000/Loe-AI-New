@@ -29,9 +29,9 @@ from config import Settings
 from database import (all_rows, count_by_status, create_lesson, create_quiz_session,
                       enroll_student, get_quiz_session, image_names, init_db, is_remote,
                       latest_pending_id, lesson_roster, list_lessons, load_image, pending_rows,
-                      quiz_history, quiz_overall, read_flag, record_quiz_answer,
-                      set_contribution_status, set_privacy_flag, snapshot_database, store_image,
-                      write_flag)
+                      quiz_history, quiz_overall, quiz_awaiting_reason, read_flag,
+                      record_quiz_answer, set_quiz_pending, set_contribution_status,
+                      set_privacy_flag, snapshot_database, store_image, write_flag)
 from dataset import export_dataset, save_image, save_text, save_voice_transcription
 from gemini_client import GeminiClient, GeminiQuotaError, GeminiUnavailableError
 from memory import ConversationMemory
@@ -510,6 +510,17 @@ GROUP_CONTEXT_MESSAGES = 12
 GROUP_CONTEXT_SECONDS = 1800.0
 _group_context: dict[int, list[tuple[float, str]]] = {}
 
+# The bot may start a line of its own, but no more often than this per chat. The
+# same floor covers the check itself, so the gate is asked at most twice an hour
+# about any one group and cannot become a quota drain.
+CHIME_MIN_SECONDS = 1800.0
+# How often the loop wakes to look for a chat that is due. Sleeping longer than
+# the floor would make the wait 30 minutes plus up to a whole tick.
+CHIME_TICK_SECONDS = 300.0
+# When the check last ran for a chat, whether or not it spoke. Only live while
+# the process is; a restart may let one early line through, which is harmless.
+_last_chime_check: dict[int, float] = {}
+
 
 def remember_group_message(chat_id: int, message: Any) -> None:
     """Keep the tail of a group's text, for the relevance gate to read later."""
@@ -539,6 +550,12 @@ def recent_group_messages(chat_id: int) -> list[str]:
     now = time.time()
     entries = [e for e in _group_context.get(chat_id, ()) if now - e[0] <= GROUP_CONTEXT_SECONDS]
     return [text for _, text in entries]
+
+
+def latest_group_activity(chat_id: int) -> float | None:
+    """When the group last said something still inside the window, or None."""
+    entries = _group_context.get(chat_id) or []
+    return entries[-1][0] if entries else None
 
 
 def forget_group_context(chat_id: int) -> None:
@@ -818,6 +835,73 @@ async def routing_flush_loop() -> None:
             raise
         except Exception:
             logger.debug("Could not write the routing tallies", exc_info=True)
+
+
+async def chime_once(bot: Any) -> None:
+    """Let the tutor speak on its own in at most one group, if the room is due.
+
+    The gate, not a timer, decides whether there is anything worth saying: this
+    only enforces that a group is recent, that the half-hour floor has passed,
+    and that there is material to read. The floor is stamped before the gate is
+    asked, so a group that has just been judged quiet is not asked again until
+    the next window rather than on every tick.
+    """
+    if router is None:
+        return
+    now = time.time()
+    for chat_id in list(_group_context):
+        last = latest_group_activity(chat_id)
+        if last is None or now - last > GROUP_CONTEXT_SECONDS:
+            continue
+        if now - _last_chime_check.get(chat_id, 0.0) < CHIME_MIN_SECONDS:
+            continue
+        _last_chime_check[chat_id] = now
+        recent = recent_group_messages(chat_id)
+        if not recent:
+            continue
+        try:
+            verdict = await router.should_chime(recent)
+        except Exception:
+            logger.debug("Participation judge failed for chat %s", chat_id,
+                         exc_info=True)
+            continue
+        if not verdict or not verdict.get("speak"):
+            continue
+        try:
+            text = await ai.compose_chime(recent, verdict.get("hint") or "")
+        except GeminiQuotaError:
+            logger.warning("No quota to speak up in chat %s", chat_id)
+            return
+        except GeminiUnavailableError:
+            logger.warning("Models busy, skipping participation in chat %s", chat_id)
+            continue
+        except Exception:
+            logger.exception("Could not compose a line for chat %s", chat_id)
+            continue
+        text = (text or "").strip()
+        # The sentinel is how the tutor declines the topic it was handed, and a
+        # line that is only punctuation carries nothing either way.
+        if not text or text.strip(" .!؟") in {"", "صمت"}:
+            continue
+        try:
+            sent = await bot.send_message(chat_id=chat_id, text=text)
+        except TelegramError:
+            logger.debug("Could not post into chat %s", chat_id, exc_info=True)
+            continue
+        remember_sent(chat_id, sent)
+        logger.info("Spoke up on its own in chat %s", chat_id)
+
+
+async def participation_loop(bot: Any) -> None:
+    """Look for a group worth a line of the tutor's own, for as long as it runs."""
+    while True:
+        await asyncio.sleep(CHIME_TICK_SECONDS)
+        try:
+            await chime_once(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Participation check failed", exc_info=True)
 
 
 async def read_routing(chat_id: int) -> dict[str, Any] | None:
@@ -2423,6 +2507,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 @allowed_chat_only
 @active_only
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await answer_quiz_reasoning(update, context):
+        return
     if not await should_answer(update, context):
         return
     message = update.effective_message
@@ -2878,16 +2964,39 @@ async def quiz_answered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if index < session["answered"]:
         await query.answer("هالجواب انقبل خلّص.", show_alert=True)
         return
+    # A question whose reason is still owed cannot be answered again. The buttons
+    # are gone from the message, but an old client can still send a callback, and
+    # a second pick while the first waits would overwrite it.
+    if session.get("pending"):
+        await query.answer("كمّل سبب جوابك الأول بالكتابة.", show_alert=True)
+        return
 
     item = questions[index]
     chosen = QUIZ_LETTERS.index(letter)
     correct = chosen == item["answer"]
-    await query.answer("صحيح ✅" if correct else "غلط ❌")
-    updated = await record_quiz_answer(settings.database_path, session_id, correct)
-    verdict = "✅ إجابة صحيحة" if correct else "❌ غلط"
-    if not correct:
-        verdict += f" — الجواب الصحيح: {QUIZ_LETTERS[item['answer']]}) {item['options'][item['answer']]}"
-    body = f"{verdict}\n\n{item['explanation']}"
+
+    if correct:
+        # A right pick is not banked yet. Recognising the option and understanding
+        # it are not the same thing, so the student is asked to justify it first
+        # and the score waits for the part that can be checked.
+        await query.answer("انـسجل — بس ليش؟")
+        await set_quiz_pending(
+            settings.database_path, session_id,
+            json.dumps({"index": index, "choice": chosen, "stage": "why"},
+                       ensure_ascii=False))
+        body = (f"✅ {QUIZ_LETTERS[chosen]}) {item['options'][chosen]}\n\n"
+                "قبل لا أثبّت الجواب — ليش اخترته؟ اكتبلي سببك بجملة.")
+        try:
+            await query.edit_message_text(body, reply_markup=None)
+        except TelegramError:
+            logger.debug("Quiz message already edited", exc_info=True)
+        return
+
+    await query.answer("غلط ❌")
+    updated = await record_quiz_answer(settings.database_path, session_id, False)
+    body = ("❌ غلط — الجواب الصحيح: "
+            f"{QUIZ_LETTERS[item['answer']]}) {item['options'][item['answer']]}\n\n"
+            f"{item['explanation']}")
     try:
         await query.edit_message_text(body, reply_markup=None)
     except TelegramError:
@@ -2895,11 +3004,113 @@ async def quiz_answered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # already correct and there is nothing left to do.
         logger.debug("Quiz message already graded", exc_info=True)
 
+    await continue_quiz(message, session, index, questions, updated)
+
+
+async def continue_quiz(message, session, index: int, questions: list,
+                        updated: dict | None) -> None:
+    """Send the next question, or the result once the exam is done."""
     if updated and updated["answered"] >= updated["total"]:
         await finish_quiz(message, session["topic"], updated["score"], updated["total"])
     elif index + 1 < len(questions):
         await message.reply_text(render_question(session["topic"], questions, index + 1),
-                                 reply_markup=question_keyboard(session_id, index + 1))
+                                 reply_markup=question_keyboard(session["id"], index + 1))
+
+
+async def answer_quiz_reasoning(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Take a student's typed reason for an answer still waiting on one.
+
+    Runs before the relevance gate, and returns True when it has consumed the
+    message. A student mid-question who types his reason is answering us, and no
+    gate should be able to drop it. When nothing is pending the message falls
+    through to the normal tutor path, which is the common case.
+    """
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if message is None or user is None or chat is None or user.is_bot:
+        return False
+    raw = message.text or ""
+    if not raw.strip() or is_command(message):
+        return False
+    session = await quiz_awaiting_reason(settings.database_path, chat.id, user.id)
+    if session is None:
+        return False
+    try:
+        questions = json.loads(session["questions"])
+        pending = json.loads(session["pending"])
+        index = int(pending["index"])
+        chosen = int(pending["choice"])
+        stage = pending.get("stage", "why")
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        # Corrupt or stale state would otherwise trap the student forever.
+        await set_quiz_pending(settings.database_path, session["id"], None)
+        return False
+    if not 0 <= index < len(questions):
+        await set_quiz_pending(settings.database_path, session["id"], None)
+        return False
+    item = questions[index]
+    if not 0 <= chosen < len(item["options"]):
+        chosen = item["answer"]
+    reason = clean_prompt(raw, context.bot.username or "") or raw
+
+    await thinking_pause(message)
+    try:
+        verdict = await ai.grade_reasoning(
+            topic=session["topic"], question=item["question"],
+            options=item["options"], chosen=chosen,
+            correct=item["answer"], reason=reason)
+    except GeminiQuotaError:
+        # Leave the answer pending so the student can send the reason again.
+        await message.reply_text(QUOTA_MESSAGE)
+        return True
+    except GeminiUnavailableError:
+        await message.reply_text(BUSY_MESSAGE)
+        return True
+    except Exception:
+        logger.exception("Reasoning check failed")
+        verdict = None
+
+    if verdict is None:
+        # The check could not run, so the student is not made to wait on it: the
+        # answer is revealed and the exam moves on.
+        await reveal_reasoned_answer(message, session, index, questions)
+        return True
+    if verdict["sound"]:
+        await message.reply_text(verdict["reply"])
+        await complete_reasoned_answer(message, session, index, questions)
+        return True
+    if stage == "why":
+        # One push, then the answer is revealed whatever comes next, so the
+        # exchange cannot loop.
+        await message.reply_text(verdict["reply"])
+        await set_quiz_pending(
+            settings.database_path, session["id"],
+            json.dumps({"index": index, "choice": chosen, "stage": "push"},
+                       ensure_ascii=False))
+        return True
+    await reveal_reasoned_answer(message, session, index, questions)
+    return True
+
+
+async def reveal_reasoned_answer(message, session, index: int,
+                                 questions: list) -> None:
+    """Reveal a correct answer whose reason did not stand up, then move on."""
+    item = questions[index]
+    await message.reply_text(
+        f"خلّينا نثبّتها — الجواب: {QUIZ_LETTERS[item['answer']]}) "
+        f"{item['options'][item['answer']]}\n\n{item['explanation']}")
+    await complete_reasoned_answer(message, session, index, questions)
+
+
+async def complete_reasoned_answer(message, session, index: int,
+                                   questions: list) -> None:
+    """Bank a justified correct answer and continue the exam."""
+    session_id = session["id"]
+    await set_quiz_pending(settings.database_path, session_id, None)
+    updated = await record_quiz_answer(settings.database_path, session_id, True)
+    await continue_quiz(message, session, index, questions, updated)
 
 
 async def finish_quiz(message, topic: str, score: int, total: int) -> None:
@@ -3029,6 +3240,10 @@ async def post_init(application: Application) -> None:
         # we most need, so the counters are written on a timer and not only
         # when the next message happens to arrive.
         spawn_background(routing_flush_loop())
+        # The tutor is allowed to start a line of its own, on the half-hour floor
+        # enforced inside chime_once. Off when there is no gate key, because the
+        # participation judge runs on the same client as the relevance gate.
+        spawn_background(participation_loop(application.bot))
     if health_port:
         spawn_background(keep_awake(health_port))
     minutes = int(os.getenv("AUTO_BACKUP_MINUTES", "0") or 0)

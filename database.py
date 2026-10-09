@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS quiz_sessions (
     score INTEGER NOT NULL DEFAULT 0,
     answered INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    finished_at TEXT
+    finished_at TEXT,
+    pending TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_quiz_sessions_student
     ON quiz_sessions(chat_id, user_id, created_at);
@@ -222,6 +223,13 @@ async def init_db(url: str) -> None:
             await db.execute("PRAGMA journal_mode = WAL")
         for statement in _statements(SCHEMA):
             await db.execute(statement)
+        # The reasoning step was added after the table shipped, and CREATE TABLE IF
+        # NOT EXISTS will not give an existing database a new column. Without this
+        # the production database would keep working right up until the first
+        # student answered, and then fail on a column that is not there.
+        rows = await _fetch_all(db, "PRAGMA table_info(quiz_sessions)")
+        if rows and "pending" not in {row["name"] for row in rows}:
+            await db.execute("ALTER TABLE quiz_sessions ADD COLUMN pending TEXT")
         await db.commit()
 
 
@@ -582,8 +590,40 @@ async def get_quiz_session(url: str, session_id: int) -> dict[str, Any] | None:
         rows = await _fetch_all(
             db,
             """SELECT id, chat_id, user_id, topic, questions, total, score,
-                      answered, created_at, finished_at
+                      answered, created_at, finished_at, pending
                FROM quiz_sessions WHERE id = ?""", (session_id,))
+    return rows[0] if rows else None
+
+
+async def set_quiz_pending(url: str, session_id: int,
+                           pending: str | None) -> None:
+    """Hold or clear the answer a student has given but not yet justified.
+
+    Stored on the session rather than in memory because the reasoning arrives as a
+    separate message, and Render restarts the process often enough that an
+    in-memory wait would lose the student's answer mid-question.
+    """
+    async with _connect(url) as db:
+        await db.execute("UPDATE quiz_sessions SET pending = ? WHERE id = ?",
+                         (pending, session_id))
+        await db.commit()
+
+
+async def quiz_awaiting_reason(url: str, chat_id: int, user_id: int) -> dict[str, Any] | None:
+    """The open session whose last answer is still waiting for a reason, if any.
+
+    A student can only be in one quiz in a chat at a time, so the newest unfinished
+    session with a pending answer is the one their next message belongs to.
+    """
+    async with _connect(url) as db:
+        rows = await _fetch_all(
+            db,
+            """SELECT id, chat_id, user_id, topic, questions, total, score,
+                      answered, created_at, finished_at, pending
+               FROM quiz_sessions
+               WHERE chat_id = ? AND user_id = ? AND finished_at IS NULL
+                 AND pending IS NOT NULL
+               ORDER BY id DESC LIMIT 1""", (chat_id, user_id))
     return rows[0] if rows else None
 
 
